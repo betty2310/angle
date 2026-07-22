@@ -1,0 +1,87 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.env.*
+!.env.example
+!.env.template
+.venv
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# IDE specific files
+.idea/
+.vscode/
+.ropeproject/
+*.swp
+*.swo
+
+# OS and local agent settings
+.DS_Store
+.claude/settings.local.json
+
+# Jupyter transient files
+.ipynb_checkpoints/
+
+# Generated analysis artifacts
+/outputs/**
+!/outputs/aoa_paper/
+!/outputs/aoa_paper/sp-partial-19-06/
+!/outputs/aoa_paper/sp-partial-19-06/18-06/
+!/outputs/aoa_paper/sp-partial-19-06/18-06/manuscript_mixed_case/
+!/outputs/aoa_paper/sp-partial-19-06/18-06/manuscript_mixed_case/*.py
+!/outputs/aoa_paper/sp-partial-19-06/18-06/manuscript_mixed_case/*.sh
+Plot/
+tmp/
+
+# Raw GNSS captures are large experiment inputs, not source files.
+*.ubx
+
+# Local datasets are not stored in Git; retain only the directory placeholder.
+/dataset/*
+!/dataset/.keep
+
+# Generated figure exports and result workbooks
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.eps
+/compare_dd_vs_ephemeris_deg.xlsx
+
+journal.pdf
+*.html
+
+.playwright-cli/**
