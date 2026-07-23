@@ -31,7 +31,7 @@ class ComponentClassifierConfig:
     """Fixed operating thresholds for graph evidence classification."""
 
     fractional_dd_collapse_threshold_cycles: float = 0.03
-    ephemeris_aoa_separation_threshold_deg: float = 10.0
+    ephemeris_predicted_separation_threshold_cycles: float = 0.05
     min_pair_epochs: int = 10
     min_observed_pair_coverage: float = 1.0
     min_collapse_fraction: float = 1.0
@@ -54,7 +54,7 @@ _PAIR_COLUMNS = {
     "left_svid",
     "right_svid",
     "median_fractional_dd_collapse_cycles",
-    "median_ephemeris_aoa_separation_deg",
+    "median_ephemeris_predicted_pair_separation_cycles",
     "epoch_count",
 }
 
@@ -73,9 +73,9 @@ def _validate_inputs(
         raise ValueError(
             "fractional_dd_collapse_threshold_cycles must be non-negative."
         )
-    if config.ephemeris_aoa_separation_threshold_deg < 0:
+    if config.ephemeris_predicted_separation_threshold_cycles < 0:
         raise ValueError(
-            "ephemeris_aoa_separation_threshold_deg must be non-negative."
+            "ephemeris_predicted_separation_threshold_cycles must be non-negative."
         )
     if config.min_pair_epochs < 1:
         raise ValueError("min_pair_epochs must be at least one.")
@@ -110,7 +110,7 @@ def _validate_inputs(
     numeric = aggregated_pairs[
         [
             "median_fractional_dd_collapse_cycles",
-            "median_ephemeris_aoa_separation_deg",
+            "median_ephemeris_predicted_pair_separation_cycles",
             "epoch_count",
         ]
     ].apply(pd.to_numeric, errors="coerce")
@@ -175,8 +175,8 @@ def classify_common_source_components(
             if present
             else float("nan")
         )
-        ephemeris_aoa_separation_deg = (
-            float(source["median_ephemeris_aoa_separation_deg"])
+        ephemeris_predicted_pair_separation_cycles = (
+            float(source["median_ephemeris_predicted_pair_separation_cycles"])
             if present
             else float("nan")
         )
@@ -185,18 +185,18 @@ def classify_common_source_components(
             and fractional_dd_collapse_cycles
             <= config.fractional_dd_collapse_threshold_cycles
         )
-        ephemeris_aoa_far = (
+        predicted_phase_distinguishable = (
             observed
-            and ephemeris_aoa_separation_deg
-            >= config.ephemeris_aoa_separation_threshold_deg
+            and ephemeris_predicted_pair_separation_cycles
+            >= config.ephemeris_predicted_separation_threshold_cycles
         )
-        informative_edge = fractional_dd_collapsed and ephemeris_aoa_far
+        informative_edge = fractional_dd_collapsed and predicted_phase_distinguishable
         if not observed:
             relation = "missing"
         elif informative_edge:
             relation = "informative_common_source"
         elif fractional_dd_collapsed:
-            relation = "angularly_noninformative_collapse"
+            relation = "predicted_phase_aliased_collapse"
         else:
             relation = "noncollapse"
         pair_rows.append(
@@ -205,11 +205,13 @@ def classify_common_source_components(
                 "left_svid": left,
                 "right_svid": right,
                 "median_fractional_dd_collapse_cycles": fractional_dd_collapse_cycles,
-                "median_ephemeris_aoa_separation_deg": ephemeris_aoa_separation_deg,
+                "median_ephemeris_predicted_pair_separation_cycles": (
+                    ephemeris_predicted_pair_separation_cycles
+                ),
                 "epoch_count": epochs,
                 "observed": observed,
                 "fractional_dd_collapsed": fractional_dd_collapsed,
-                "ephemeris_aoa_far": ephemeris_aoa_far,
+                "predicted_phase_distinguishable": predicted_phase_distinguishable,
                 "informative_common_source_edge": informative_edge,
                 "relation": relation,
             }

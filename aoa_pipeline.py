@@ -2006,6 +2006,23 @@ def wrap_cycles(values: float | np.ndarray | pd.Series) -> float | np.ndarray | 
     return (values + 0.5) % 1.0 - 0.5
 
 
+def compute_ephemeris_predicted_pair_separation_cycles(
+    left_aoa_deg: float | np.ndarray | pd.Series,
+    right_aoa_deg: float | np.ndarray | pd.Series,
+    *,
+    baseline_over_wavelength: float,
+) -> float | np.ndarray | pd.Series:
+    """Project two ephemeris AoAs into observable fractional carrier separation."""
+    if baseline_over_wavelength <= 0:
+        raise ValueError("baseline_over_wavelength must be positive.")
+    left_direction_cosine = np.cos(np.deg2rad(left_aoa_deg))
+    right_direction_cosine = np.cos(np.deg2rad(right_aoa_deg))
+    predicted_pair_cycles = baseline_over_wavelength * (
+        left_direction_cosine - right_direction_cosine
+    )
+    return abs(wrap_cycles(predicted_pair_cycles))
+
+
 def compute_wrapped_pairwise_residuals(
     single_difference_cycles: pd.DataFrame,
     ephemeris_aoa_deg: pd.DataFrame,
