@@ -1,6 +1,11 @@
 import unittest
 
-from aoa_pipeline import compute_ephemeris_predicted_pair_separation_cycles
+import pandas as pd
+
+from aoa_pipeline import (
+    _pivot_rawx,
+    compute_ephemeris_predicted_pair_separation_cycles,
+)
 
 
 class EphemerisPairwisePhaseProjectionTests(unittest.TestCase):
@@ -28,6 +33,30 @@ class EphemerisPairwisePhaseProjectionTests(unittest.TestCase):
         self.assertAlmostEqual(float(near_baseline), 0.0451151322, places=9)
         self.assertAlmostEqual(float(broadside), 0.1736481777, places=9)
         self.assertGreater(float(broadside), float(near_baseline))
+
+
+class RawxCarrierPhaseQualityTests(unittest.TestCase):
+    def test_phase_pivot_rejects_unresolved_half_cycle_measurements(self):
+        rawx = pd.DataFrame(
+            {
+                "epoch_index": [0, 1, 2],
+                "svid": [6, 6, 6],
+                "carrier_phase_cycles": [10.0, 11.5, 12.0],
+                "cp_valid": [1, 1, 0],
+                "half_cycle": [1, 0, 1],
+            }
+        )
+
+        result = _pivot_rawx(
+            rawx,
+            "carrier_phase_cycles",
+            pd.Index([0, 1, 2], name="epoch_index"),
+            require_valid_phase=True,
+        )
+
+        self.assertEqual(result.loc[0, 6], 10.0)
+        self.assertTrue(pd.isna(result.loc[1, 6]))
+        self.assertTrue(pd.isna(result.loc[2, 6]))
 
 
 if __name__ == "__main__":

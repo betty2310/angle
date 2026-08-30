@@ -449,8 +449,13 @@ def _pivot_rawx(
         return pd.DataFrame(index=epoch_index)
 
     valid = rawx[value_col].notna() & rawx["svid"].notna()
-    if require_valid_phase and rawx["cp_valid"].notna().any():
-        valid &= rawx["cp_valid"].fillna(0).astype(int).eq(1)
+    if require_valid_phase:
+        if rawx["cp_valid"].notna().any():
+            valid &= rawx["cp_valid"].fillna(0).astype(int).eq(1)
+        # Eq. 18 rounds DD to whole cycles, so unresolved half-cycle ambiguity
+        # cannot be treated as a valid carrier-phase measurement.
+        if rawx["half_cycle"].notna().any():
+            valid &= rawx["half_cycle"].fillna(0).astype(int).eq(1)
 
     pivot = rawx.loc[valid].pivot_table(
         index="epoch_index",
