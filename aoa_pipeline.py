@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from itertools import combinations, product
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -82,6 +82,10 @@ class DatasetConfig:
     baseline_over_wavelength: float = 1.0
     single_difference_order: str = "rx1-rx2"
     branch_values: tuple[int, ...] = (-2, -1, 0, 1, 2)
+    # Quantity whose epoch-to-epoch step the Algorithm 1 DP minimises: "direction_cosine"
+    # (cos alpha, where the Eq. 21 branches are exact unit shifts of each other, so equally
+    # smooth branches tie) or "aoa_deg" (degrees; legacy, favours the branch nearer 90 deg).
+    branch_metric: str = "direction_cosine"
     navsat_azimuth_bias_deg: float | None = None
     output_root: str | Path = Path("outputs/aoa_paper")
 
@@ -95,6 +99,9 @@ class UbxObservationTables:
     rawx: pd.DataFrame
     navsat: pd.DataFrame
     navpvt: pd.DataFrame
+    # UBX message identity -> count over the parsed part of the log (all identities,
+    # not only the three tables above); empty for tables derived by sync/slice.
+    message_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -164,6 +171,13 @@ class PaperScenarioResult:
     sv_used_summary: pd.DataFrame
     run_summary: pd.DataFrame
     output_paths: dict[str, Path] = field(default_factory=dict)
+    # Partial-spoof only: per-epoch branch ambiguity of the joint-source selection, every
+    # valid Eq. 21 branch of the spoof PRNs, and the per-PRN detection table (both branches
+    # against the ephemeris-based AoA).
+    joint_source_ambiguity: pd.DataFrame = field(default_factory=pd.DataFrame)
+    spoof_branch_candidates: pd.DataFrame = field(default_factory=pd.DataFrame)
+    spoof_branch_detection: pd.DataFrame = field(default_factory=pd.DataFrame)
+    prior_aoa_deg: float | None = None
 
 
 def _make_ubx_reader(stream) -> UBXReader:
@@ -313,11 +327,13 @@ def read_ubx_observations(
     rawx_rows: list[dict[str, object]] = []
     navsat_rows: list[dict[str, object]] = []
     navpvt_rows: list[dict[str, object]] = []
+    message_counts: dict[str, int] = {}
     rawx_epoch_count = 0
 
     with ubx_path.open("rb") as stream:
         for _, parsed_data in _make_ubx_reader(stream):
             identity = getattr(parsed_data, "identity", "")
+            message_counts[identity] = message_counts.get(identity, 0) + 1
             if identity == "RXM-RAWX":
                 rawx_epoch_count += 1
                 rawx_rows.extend(
@@ -333,7 +349,9 @@ def read_ubx_observations(
     rawx = pd.DataFrame(rawx_rows, columns=RAWX_COLUMNS)
     navsat = pd.DataFrame(navsat_rows, columns=NAVSAT_COLUMNS)
     navpvt = pd.DataFrame(navpvt_rows, columns=NAVPVT_COLUMNS)
-    return UbxObservationTables(rawx=rawx, navsat=navsat, navpvt=navpvt)
+    return UbxObservationTables(
+        rawx=rawx, navsat=navsat, navpvt=navpvt, message_counts=message_counts
+    )
 
 
 def _with_sync_tow(rawx: pd.DataFrame, tow_round_decimals: int | None) -> pd.DataFrame:
@@ -831,28 +849,62 @@ def _valid_segments(index_values: list[int], valid_mask: pd.Series) -> list[list
     return segments
 
 
-def _dp_select_segment(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+BRANCH_METRICS = ("direction_cosine", "aoa_deg")
+
+
+def _validate_branch_metric(metric: str) -> None:
+    if metric not in BRANCH_METRICS:
+        raise ValueError(f"metric must be one of {BRANCH_METRICS}, got {metric!r}")
+
+
+def _dp_select_segment(
+    values: np.ndarray,
+    cost_values: np.ndarray | None = None,
+    tie_break: np.ndarray | None = None,
+    tie_tolerance: float = 1e-9,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run Algorithm 1 on one continuous segment of candidates.
+
+    ``values`` (epochs x branches) holds the candidate AoA in degrees that is returned.
+    ``cost_values`` (same shape, defaults to ``values``) holds the numbers whose absolute
+    epoch-to-epoch step the DP minimises; passing direction cosines makes the Eq. 21
+    branches exact unit shifts of each other, so equally smooth branches tie instead of
+    the branch nearer 90 deg winning. ``tie_break`` gives one secondary key per column
+    (for example ``|m|``): when several end states lie within ``tie_tolerance`` of the
+    minimum total cost, the smallest key wins instead of the first column.
+    """
+    cost_source = values if cost_values is None else cost_values
+    if cost_source.shape != values.shape:
+        raise ValueError("cost_values must have the same shape as values.")
     rows, cols = values.shape
     costs = np.full((rows, cols), np.inf, dtype=float)
     back = np.full((rows, cols), -1, dtype=int)
-    valid_first = np.isfinite(values[0])
+    valid_first = np.isfinite(cost_source[0])
     costs[0, valid_first] = 0.0
 
     for row in range(1, rows):
+        previous_values = cost_source[row - 1]
         for current_col in range(cols):
-            current_value = values[row, current_col]
+            current_value = cost_source[row, current_col]
             if not np.isfinite(current_value):
                 continue
-            previous_values = values[row - 1]
             transition = costs[row - 1] + np.abs(current_value - previous_values)
+            if not np.isfinite(transition).any():
+                continue
             best_previous = int(np.nanargmin(transition))
-            if np.isfinite(transition[best_previous]):
-                costs[row, current_col] = transition[best_previous]
-                back[row, current_col] = best_previous
+            costs[row, current_col] = transition[best_previous]
+            back[row, current_col] = best_previous
 
-    end_col = int(np.nanargmin(costs[-1]))
-    if not np.isfinite(costs[-1, end_col]):
+    end_costs = costs[-1]
+    finite_end = np.isfinite(end_costs)
+    if not finite_end.any():
         return np.full(rows, np.nan), np.full(rows, np.nan)
+    min_cost = float(end_costs[finite_end].min())
+    tied = np.flatnonzero(finite_end & (end_costs <= min_cost + tie_tolerance))
+    end_col = int(tied[0])
+    if tie_break is not None and len(tied) > 1:
+        keys = np.asarray(tie_break, dtype=float)[tied]
+        end_col = int(tied[int(np.argmin(keys))])
 
     selected_cols = np.full(rows, end_col, dtype=int)
     for row in range(rows - 1, 0, -1):
@@ -867,9 +919,22 @@ def select_aoa_dp(
     reference_svid: int | None = None,
     reference_angle_deg: float | pd.Series | None = None,
     return_branches: bool = False,
+    *,
+    metric: str = "direction_cosine",
 ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
-    """Select a smooth AoA sequence per satellite using Algorithm 1."""
+    """Select a smooth AoA sequence per satellite using Algorithm 1.
+
+    ``metric`` is the quantity whose epoch-to-epoch change the DP minimises.
+    ``"direction_cosine"`` (default) scores ``cos(alpha)``: the Eq. 21 branches then differ
+    by exactly ``1 / (D / lambda)`` at every epoch, so equally smooth branches tie and the
+    tie goes to the smallest ``|m|``. ``"aoa_deg"`` scores degrees, the original behaviour;
+    arccos maps the same phase noise to smaller degree steps near 90 deg, so that metric
+    favours the branch nearer 90 deg whatever the true direction.
+    """
+    _validate_branch_metric(metric)
     required = {"epoch_index", "svid", "branch", "candidate_aoa_deg"}
+    if metric == "direction_cosine":
+        required.add("candidate_cos_alpha")
     missing = required - set(candidates.columns)
     if missing:
         raise ValueError(f"candidates is missing required columns: {sorted(missing)}")
@@ -877,6 +942,7 @@ def select_aoa_dp(
     all_epochs = sorted(int(epoch) for epoch in candidates["epoch_index"].unique())
     all_svids = sorted(int(svid) for svid in candidates["svid"].unique())
     branch_values = sorted(int(branch) for branch in candidates["branch"].unique())
+    tie_break = np.abs(np.asarray(branch_values, dtype=float))
     selected = pd.DataFrame(index=all_epochs, columns=all_svids, dtype=float)
     branches = pd.DataFrame(index=all_epochs, columns=all_svids, dtype=float)
     selected.index.name = "epoch_index"
@@ -891,10 +957,27 @@ def select_aoa_dp(
             aggfunc="first",
         )
         pivot = pivot.reindex(index=all_epochs, columns=branch_values)
+        cost_pivot = None
+        if metric == "direction_cosine":
+            cost_pivot = subset.pivot_table(
+                index="epoch_index",
+                columns="branch",
+                values="candidate_cos_alpha",
+                aggfunc="first",
+            )
+            cost_pivot = cost_pivot.reindex(index=all_epochs, columns=branch_values)
+            cost_pivot = cost_pivot.where(pivot.notna())
         valid_mask = pivot.notna().any(axis=1)
         for segment in _valid_segments(all_epochs, valid_mask):
             values = pivot.loc[segment].to_numpy(dtype=float)
-            segment_values, selected_cols = _dp_select_segment(values)
+            cost_values = (
+                None
+                if cost_pivot is None
+                else cost_pivot.loc[segment].to_numpy(dtype=float)
+            )
+            segment_values, selected_cols = _dp_select_segment(
+                values, cost_values, tie_break
+            )
             selected.loc[segment, svid] = segment_values
             for epoch, col in zip(segment, selected_cols):
                 if np.isfinite(col):
@@ -1668,16 +1751,71 @@ def summarize_sv_used(
     return pd.DataFrame(rows)
 
 
+def _branch_step_direction_cosine(candidates: pd.DataFrame) -> float:
+    """Direction-cosine step between adjacent Eq. 21 branches, i.e. ``1 / (D / lambda)``."""
+    data = candidates.dropna(subset=["candidate_cos_alpha"])
+    if data.empty:
+        return 1.0
+    ordered = data.sort_values(["epoch_index", "svid", "branch"])
+    grouped = ordered.groupby(["epoch_index", "svid"], sort=False)
+    step = grouped["candidate_cos_alpha"].diff() / grouped["branch"].diff()
+    step = step.replace([np.inf, -np.inf], np.nan).dropna()
+    return float(step.median()) if not step.empty else 1.0
+
+
+def _format_branches(branches: Sequence[int]) -> str:
+    return ",".join(str(int(branch)) for branch in branches)
+
+
 def select_joint_source_aoa(
     candidates: pd.DataFrame,
     svids: Sequence[int],
+    *,
+    metric: str = "direction_cosine",
+    prior_aoa_deg: float | None = None,
+    prior_weight: float = 1.0,
+    tie_tolerance: float | None = None,
     spread_weight: float = 4.0,
     smooth_weight: float = 1.0,
     max_states_per_epoch: int = 50_000,
     return_branches: bool = False,
-) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
-    """Select AoA branches jointly for satellites expected to share one RF source."""
-    required = {"epoch_index", "svid", "branch", "candidate_aoa_deg"}
+    return_ambiguity: bool = False,
+):
+    """Select Eq. 21 branches jointly for satellites expected to share one RF source.
+
+    Every epoch has one state per branch combination of the group. The DP minimises
+    ``spread_weight * (max - min over the group) + smooth_weight * mean |step from the
+    previous epoch|``, both measured in ``metric`` units (see :func:`select_aoa_dp`).
+
+    With a one-wavelength baseline the fractional DD fixes ``cos(alpha)`` only modulo one,
+    so shifting every satellite's branch by the same integer yields a second combination
+    with identical spread and step costs: a static capture cannot tell the two apart. The
+    function therefore evaluates every uniform shift of the DP path. An alternative counts
+    as tied when its direction cosines leave ``[-1, 1]`` by at most ``tie_tolerance`` on
+    average over the window (``None``: three times the median per-epoch group spread plus
+    step in direction cosine, at least 0.01). The tie is broken in this order and recorded
+    in the ambiguity table as ``chosen_by``:
+
+    - ``"data"``: no tied alternative, the DP path stands;
+    - ``"prior"``: ``prior_aoa_deg`` picks, among the DP path and the tied alternatives, the
+      combination minimising ``mean excess + prior_weight * |cos(median AoA) - cos(prior)|``;
+    - ``"unresolved"``: no prior. With ``metric="direction_cosine"`` the fully valid tied
+      combination with the smallest mean ``|m|`` is reported; with ``"aoa_deg"`` the DP path
+      (the legacy choice, nearer 90 deg). Report both branches side by side in that case.
+
+    Returns the selected AoA (epochs x svids). ``return_branches`` adds the selected branch
+    ``m`` per epoch and satellite; ``return_ambiguity`` adds a per-epoch table with the DP
+    cost, the cost and out-of-range excess of the closest alternative combination, the
+    branch shifts (relative to the selection), the tied shifts and ``chosen_by``.
+    """
+    _validate_branch_metric(metric)
+    required = {
+        "epoch_index",
+        "svid",
+        "branch",
+        "candidate_aoa_deg",
+        "candidate_cos_alpha",
+    }
     missing = required - set(candidates.columns)
     if missing:
         raise ValueError(f"candidates is missing required columns: {sorted(missing)}")
@@ -1685,6 +1823,10 @@ def select_joint_source_aoa(
     selected_svids = _normalise_svids(svids) or ()
     if not selected_svids:
         raise ValueError("At least one SVID is required.")
+    if prior_weight < 0:
+        raise ValueError("prior_weight must be non-negative.")
+    if tie_tolerance is not None and tie_tolerance < 0:
+        raise ValueError("tie_tolerance must be non-negative.")
 
     branch_values = sorted(int(branch) for branch in candidates["branch"].unique())
     if len(branch_values) ** len(selected_svids) > max_states_per_epoch:
@@ -1693,39 +1835,42 @@ def select_joint_source_aoa(
             "or increase max_states_per_epoch."
         )
 
-    epochs = sorted(int(epoch) for epoch in candidates["epoch_index"].unique())
+    group = candidates.loc[candidates["svid"].isin(selected_svids)]
+    unit = _branch_step_direction_cosine(group)
+    per_epoch: dict[int, dict[int, dict[int, tuple[float, float]]]] = {}
+    for row in group.loc[group["candidate_aoa_deg"].notna()].itertuples():
+        per_epoch.setdefault(int(row.epoch_index), {}).setdefault(int(row.svid), {})[
+            int(row.branch)
+        ] = (float(row.candidate_aoa_deg), float(row.candidate_cos_alpha))
+    use_cosine = metric == "direction_cosine"
+
     states_by_epoch: list[list[dict[str, object]]] = []
     valid_epochs: list[int] = []
-    for epoch in epochs:
-        per_sat: dict[int, dict[int, float]] = {}
-        for svid in selected_svids:
-            subset = candidates.loc[
-                candidates["epoch_index"].eq(epoch)
-                & candidates["svid"].eq(svid)
-                & candidates["candidate_aoa_deg"].notna()
-            ]
-            per_sat[svid] = {
-                int(row.branch): float(row.candidate_aoa_deg)
-                for row in subset.itertuples()
-            }
-
+    for epoch in sorted(per_epoch):
+        per_sat = per_epoch[epoch]
+        if any(svid not in per_sat for svid in selected_svids):
+            continue
         epoch_states: list[dict[str, object]] = []
         for branch_combo in product(branch_values, repeat=len(selected_svids)):
-            values: list[float] = []
-            for svid, branch in zip(selected_svids, branch_combo):
-                if branch not in per_sat[svid]:
-                    break
-                values.append(per_sat[svid][branch])
-            else:
-                value_array = np.asarray(values, dtype=float)
-                epoch_states.append(
-                    {
-                        "branches": tuple(int(branch) for branch in branch_combo),
-                        "values": value_array,
-                        "spread": float(value_array.max() - value_array.min()),
-                    }
-                )
-
+            try:
+                pairs = [
+                    per_sat[svid][branch]
+                    for svid, branch in zip(selected_svids, branch_combo)
+                ]
+            except KeyError:
+                continue
+            aoa = np.asarray([pair[0] for pair in pairs], dtype=float)
+            cos_alpha = np.asarray([pair[1] for pair in pairs], dtype=float)
+            score = cos_alpha if use_cosine else aoa
+            epoch_states.append(
+                {
+                    "branches": tuple(int(branch) for branch in branch_combo),
+                    "aoa": aoa,
+                    "cos": cos_alpha,
+                    "score": score,
+                    "spread": float(score.max() - score.min()),
+                }
+            )
         if epoch_states:
             states_by_epoch.append(epoch_states)
             valid_epochs.append(epoch)
@@ -1734,8 +1879,32 @@ def select_joint_source_aoa(
     branches = pd.DataFrame(index=valid_epochs, columns=selected_svids, dtype=float)
     selected.index.name = "epoch_index"
     branches.index.name = "epoch_index"
+    ambiguity_columns = [
+        "epoch_index",
+        "dp_branches",
+        "dp_cost",
+        "selected_branches",
+        "selected_cost",
+        "alternative_shift",
+        "alternative_branches",
+        "alternative_cost",
+        "alternative_excess",
+        "alternative_mean_excess",
+        "tied_shifts",
+        "ambiguous",
+        "chosen_by",
+        "tie_tolerance",
+        "metric",
+        "prior_aoa_deg",
+    ]
     if not states_by_epoch:
-        return (selected, branches) if return_branches else selected
+        ambiguity = pd.DataFrame(columns=ambiguity_columns)
+        outputs: list[pd.DataFrame] = [selected]
+        if return_branches:
+            outputs.append(branches)
+        if return_ambiguity:
+            outputs.append(ambiguity)
+        return tuple(outputs) if len(outputs) > 1 else selected
 
     costs: list[np.ndarray] = [
         np.asarray(
@@ -1744,22 +1913,22 @@ def select_joint_source_aoa(
         )
     ]
     backs: list[np.ndarray] = [np.full(len(states_by_epoch[0]), -1, dtype=int)]
-    for epoch_index in range(1, len(states_by_epoch)):
-        previous_states = states_by_epoch[epoch_index - 1]
-        current_states = states_by_epoch[epoch_index]
+    for epoch_position in range(1, len(states_by_epoch)):
+        previous_states = states_by_epoch[epoch_position - 1]
+        current_states = states_by_epoch[epoch_position]
         epoch_cost = np.full(len(current_states), np.inf, dtype=float)
         epoch_back = np.full(len(current_states), -1, dtype=int)
         for current_index, current_state in enumerate(current_states):
-            current_values = current_state["values"]
+            current_values = current_state["score"]
             transition = np.asarray(
                 [
-                    np.mean(np.abs(current_values - previous_state["values"]))
+                    np.mean(np.abs(current_values - previous_state["score"]))
                     for previous_state in previous_states
                 ],
                 dtype=float,
             )
             total = (
-                costs[epoch_index - 1]
+                costs[epoch_position - 1]
                 + smooth_weight * transition
                 + spread_weight * float(current_state["spread"])
             )
@@ -1770,21 +1939,364 @@ def select_joint_source_aoa(
         backs.append(epoch_back)
 
     path = [int(np.nanargmin(costs[-1]))]
-    for epoch_index in range(len(states_by_epoch) - 1, 0, -1):
-        path.append(int(backs[epoch_index][path[-1]]))
+    for epoch_position in range(len(states_by_epoch) - 1, 0, -1):
+        path.append(int(backs[epoch_position][path[-1]]))
     path = list(reversed(path))
 
-    for epoch, state_index, epoch_states in zip(valid_epochs, path, states_by_epoch):
-        state = epoch_states[state_index]
-        for svid, value, branch in zip(
-            selected_svids, state["values"], state["branches"]
-        ):
-            selected.loc[epoch, svid] = float(value)
-            branches.loc[epoch, svid] = int(branch)
+    dp_states = [states_by_epoch[position][index] for position, index in enumerate(path)]
+    dp_branches = np.asarray([state["branches"] for state in dp_states], dtype=int)
+    dp_aoa = np.asarray([state["aoa"] for state in dp_states], dtype=float)
+    dp_cos = np.asarray([state["cos"] for state in dp_states], dtype=float)
 
+    def per_epoch_cost(score: np.ndarray) -> np.ndarray:
+        spread = score.max(axis=1) - score.min(axis=1)
+        step = np.zeros(len(score), dtype=float)
+        if len(score) > 1:
+            step[1:] = np.abs(np.diff(score, axis=0)).mean(axis=1)
+        return spread_weight * spread + smooth_weight * step
+
+    def evaluate_shift(shift: int) -> dict[str, object]:
+        raw_cos = dp_cos + shift * unit
+        excess = np.clip(np.abs(raw_cos) - 1.0, 0.0, None).max(axis=1)
+        clipped_cos = np.clip(raw_cos, -1.0, 1.0)
+        clipped_aoa = np.degrees(np.arccos(clipped_cos))
+        score = clipped_cos if use_cosine else clipped_aoa
+        return {
+            "shift": int(shift),
+            "branches": dp_branches + int(shift),
+            "excess": excess,
+            "mean_excess": float(excess.mean()),
+            "fully_valid": bool(excess.max() == 0.0),
+            "cost": per_epoch_cost(score),
+            "median_aoa_deg": float(np.median(clipped_aoa)),
+            "mean_abs_branch": float(np.abs(dp_branches + int(shift)).mean()),
+        }
+
+    cos_spread = dp_cos.max(axis=1) - dp_cos.min(axis=1)
+    cos_step = np.zeros(len(dp_cos), dtype=float)
+    if len(dp_cos) > 1:
+        cos_step[1:] = np.abs(np.diff(dp_cos, axis=0)).mean(axis=1)
+    if tie_tolerance is None:
+        tolerance = max(3.0 * float(np.median(cos_spread + cos_step)), 0.01)
+    else:
+        tolerance = float(tie_tolerance)
+
+    allowed = set(branch_values)
+    shifts = [
+        shift
+        for shift in range(
+            min(branch_values) - int(dp_branches.max()),
+            max(branch_values) - int(dp_branches.min()) + 1,
+        )
+        if shift != 0 and set(np.unique(dp_branches + shift).tolist()) <= allowed
+    ]
+    evaluations = {0: evaluate_shift(0)}
+    for shift in shifts:
+        evaluations[shift] = evaluate_shift(shift)
+    tied = [shift for shift in shifts if evaluations[shift]["mean_excess"] <= tolerance]
+    ambiguous = bool(tied)
+    options = [0, *tied]
+
+    if not ambiguous:
+        selected_shift = 0
+        chosen_by = "data"
+    elif prior_aoa_deg is not None:
+        prior_cos = float(np.cos(np.deg2rad(float(prior_aoa_deg))))
+        selected_shift = min(
+            options,
+            key=lambda shift: (
+                float(evaluations[shift]["mean_excess"])
+                + prior_weight
+                * abs(
+                    float(np.cos(np.deg2rad(evaluations[shift]["median_aoa_deg"])))
+                    - prior_cos
+                ),
+                abs(shift),
+            ),
+        )
+        chosen_by = "prior"
+    else:
+        chosen_by = "unresolved"
+        if use_cosine:
+            selectable = [
+                shift for shift in options if evaluations[shift]["fully_valid"]
+            ] or [0]
+            selected_shift = min(
+                selectable,
+                key=lambda shift: (
+                    float(evaluations[shift]["mean_abs_branch"]),
+                    abs(shift),
+                ),
+            )
+        else:
+            selected_shift = 0
+
+    others = [shift for shift in options if shift != selected_shift]
+    if others:
+        alternative = min(
+            others,
+            key=lambda shift: (
+                float(evaluations[shift]["mean_excess"]),
+                abs(shift - selected_shift),
+            ),
+        )
+    elif shifts:
+        alternative = min(
+            shifts,
+            key=lambda shift: (float(evaluations[shift]["mean_excess"]), abs(shift)),
+        )
+    else:
+        alternative = None
+
+    selected_branches = dp_branches + selected_shift
+    for position, epoch in enumerate(valid_epochs):
+        for column, svid in enumerate(selected_svids):
+            branch = int(selected_branches[position, column])
+            pair = per_epoch[epoch].get(svid, {}).get(branch)
+            branches.loc[epoch, svid] = branch
+            selected.loc[epoch, svid] = np.nan if pair is None else pair[0]
+
+    selected_evaluation = evaluations[selected_shift]
+    alternative_evaluation = None if alternative is None else evaluations[alternative]
+    tied_relative = [shift - selected_shift for shift in options if shift != selected_shift]
+    ambiguity = pd.DataFrame(
+        {
+            "epoch_index": valid_epochs,
+            "dp_branches": [_format_branches(row) for row in dp_branches],
+            "dp_cost": evaluations[0]["cost"],
+            "selected_branches": [_format_branches(row) for row in selected_branches],
+            "selected_cost": selected_evaluation["cost"],
+            "alternative_shift": (
+                np.nan if alternative is None else int(alternative - selected_shift)
+            ),
+            "alternative_branches": (
+                ""
+                if alternative_evaluation is None
+                else [
+                    _format_branches(row) for row in alternative_evaluation["branches"]
+                ]
+            ),
+            "alternative_cost": (
+                np.nan if alternative_evaluation is None else alternative_evaluation["cost"]
+            ),
+            "alternative_excess": (
+                np.nan
+                if alternative_evaluation is None
+                else alternative_evaluation["excess"]
+            ),
+            "alternative_mean_excess": (
+                np.nan
+                if alternative_evaluation is None
+                else alternative_evaluation["mean_excess"]
+            ),
+            "tied_shifts": ",".join(str(int(shift)) for shift in tied_relative),
+            "ambiguous": ambiguous,
+            "chosen_by": chosen_by,
+            "tie_tolerance": tolerance,
+            "metric": metric,
+            "prior_aoa_deg": np.nan if prior_aoa_deg is None else float(prior_aoa_deg),
+        },
+        columns=ambiguity_columns,
+    )
+
+    outputs = [selected]
     if return_branches:
-        return selected, branches
-    return selected
+        outputs.append(branches)
+    if return_ambiguity:
+        outputs.append(ambiguity)
+    return tuple(outputs) if len(outputs) > 1 else selected
+
+
+def summarize_branch_candidates(
+    candidates: pd.DataFrame,
+    svids: Sequence[int] | None = None,
+) -> pd.DataFrame:
+    """Per satellite and Eq. 21 branch ``m``: epoch count, median/mean/std AoA, median cos.
+
+    Lists every physically valid branch, so the one-wavelength mirror is visible next to
+    whatever :func:`select_joint_source_aoa` or :func:`select_aoa_dp` picked.
+    """
+    required = {"epoch_index", "svid", "branch", "candidate_aoa_deg", "candidate_cos_alpha"}
+    missing = required - set(candidates.columns)
+    if missing:
+        raise ValueError(f"candidates is missing required columns: {sorted(missing)}")
+    columns = [
+        "svid",
+        "branch",
+        "epoch_count",
+        "median_aoa_deg",
+        "mean_aoa_deg",
+        "std_aoa_deg",
+        "min_aoa_deg",
+        "max_aoa_deg",
+        "median_cos_alpha",
+    ]
+    valid = candidates.loc[candidates["candidate_aoa_deg"].notna()]
+    selected = _normalise_svids(svids)
+    if selected is not None:
+        valid = valid.loc[valid["svid"].isin(selected)]
+    if valid.empty:
+        return pd.DataFrame(columns=columns)
+    summary = (
+        valid.groupby(["svid", "branch"])
+        .agg(
+            epoch_count=("epoch_index", "nunique"),
+            median_aoa_deg=("candidate_aoa_deg", "median"),
+            mean_aoa_deg=("candidate_aoa_deg", "mean"),
+            std_aoa_deg=("candidate_aoa_deg", "std"),
+            min_aoa_deg=("candidate_aoa_deg", "min"),
+            max_aoa_deg=("candidate_aoa_deg", "max"),
+            median_cos_alpha=("candidate_cos_alpha", "median"),
+        )
+        .reset_index()
+    )
+    summary["svid"] = summary["svid"].astype(int)
+    summary["branch"] = summary["branch"].astype(int)
+    return summary.sort_values(["svid", "branch"]).reset_index(drop=True)[columns]
+
+
+def summarize_spoof_branch_detection(
+    branch_candidates: pd.DataFrame,
+    ephemeris_aoa_deg: pd.DataFrame,
+    *,
+    selected_branch_by_svid: Mapping[int, int],
+    alternative_branch_by_svid: Mapping[int, int] | None = None,
+    chosen_by: str = "unresolved",
+    threshold_deg: float = 10.0,
+    min_branch_epoch_fraction: float = 0.5,
+) -> pd.DataFrame:
+    """Per spoof PRN: ephemeris-based AoA against the DD-method AoA of both Eq. 21 branches.
+
+    ``spoof_flag_selected`` is the paper's threshold test on the selected branch.
+    ``spoof_flag_all_branches`` is true only when every valid branch (with at least
+    ``min_branch_epoch_fraction`` of the PRN's best branch epoch count) disagrees with the
+    ephemeris by more than ``threshold_deg``, i.e. the verdict does not depend on how the
+    one-wavelength ambiguity was resolved. Both flags are ``<NA>`` when the PRN has no
+    ephemeris-based AoA inside the window.
+    """
+    rows: list[dict[str, object]] = []
+    alternatives = dict(alternative_branch_by_svid or {})
+    ephemeris_columns = {int(column): column for column in ephemeris_aoa_deg.columns}
+    for svid, selected_branch in sorted(
+        (int(svid), int(branch)) for svid, branch in selected_branch_by_svid.items()
+    ):
+        per_branch = branch_candidates.loc[branch_candidates["svid"].eq(svid)].set_index(
+            "branch"
+        )
+        ephemeris = pd.Series(dtype=float)
+        if svid in ephemeris_columns:
+            ephemeris = ephemeris_aoa_deg[ephemeris_columns[svid]].dropna()
+        ephemeris_median = float(ephemeris.median()) if not ephemeris.empty else np.nan
+
+        def branch_stats(branch: int | None) -> tuple[float, float, int]:
+            if branch is None or int(branch) not in per_branch.index:
+                return np.nan, np.nan, 0
+            entry = per_branch.loc[int(branch)]
+            return (
+                float(entry["median_aoa_deg"]),
+                float(entry["std_aoa_deg"]),
+                int(entry["epoch_count"]),
+            )
+
+        alternative_branch = alternatives.get(svid)
+        selected_aoa, selected_std, selected_epochs = branch_stats(selected_branch)
+        alternative_aoa, alternative_std, alternative_epochs = branch_stats(
+            None if alternative_branch is None else int(alternative_branch)
+        )
+        abs_diff_selected = abs(selected_aoa - ephemeris_median)
+        abs_diff_alternative = abs(alternative_aoa - ephemeris_median)
+
+        considered: list[str] = []
+        all_disagree = not per_branch.empty and np.isfinite(ephemeris_median)
+        if not per_branch.empty:
+            minimum_epochs = min_branch_epoch_fraction * float(per_branch["epoch_count"].max())
+            for branch, entry in per_branch.sort_index().iterrows():
+                if float(entry["epoch_count"]) < minimum_epochs:
+                    continue
+                difference = abs(float(entry["median_aoa_deg"]) - ephemeris_median)
+                considered.append(f"m={int(branch)}:{float(entry['median_aoa_deg']):.1f}")
+                if not (difference > threshold_deg):
+                    all_disagree = False
+        rows.append(
+            {
+                "svid": svid,
+                "ephemeris_aoa_deg": ephemeris_median,
+                "ephemeris_epochs": int(len(ephemeris)),
+                "selected_m": selected_branch,
+                "selected_aoa_deg": selected_aoa,
+                "selected_std_deg": selected_std,
+                "selected_epochs": selected_epochs,
+                "alternative_m": (
+                    np.nan if alternative_branch is None else int(alternative_branch)
+                ),
+                "alternative_aoa_deg": alternative_aoa,
+                "alternative_std_deg": alternative_std,
+                "alternative_epochs": alternative_epochs,
+                "chosen_by": chosen_by,
+                "abs_diff_selected_deg": abs_diff_selected,
+                "abs_diff_alternative_deg": abs_diff_alternative,
+                "threshold_deg": float(threshold_deg),
+                "spoof_flag_selected": (
+                    bool(abs_diff_selected > threshold_deg)
+                    if np.isfinite(abs_diff_selected)
+                    else pd.NA
+                ),
+                "spoof_flag_all_branches": (
+                    bool(all_disagree) if np.isfinite(ephemeris_median) else pd.NA
+                ),
+                "branches_considered": "|".join(considered),
+            }
+        )
+    detection = pd.DataFrame(rows)
+    for column in ("spoof_flag_selected", "spoof_flag_all_branches"):
+        if column in detection.columns:
+            detection[column] = detection[column].astype("boolean")
+    return detection
+
+
+def summarize_pairwise_single_difference_collapse(
+    single_difference_cycles: pd.DataFrame,
+    svids: Sequence[int],
+) -> pd.DataFrame:
+    """Median ``|wrap(SD_i - SD_j)|`` per pair of a spoof group over every common epoch.
+
+    Two signals from one source have equal single differences up to an integer, so this
+    branch-free, anchor-free number is the common-source evidence; it needs no reference
+    satellite, no reference-angle anchor and no ephemeris.
+    """
+    columns = {int(column): column for column in single_difference_cycles.columns}
+    present = [svid for svid in (_normalise_svids(svids) or ()) if svid in columns]
+    rows: list[dict[str, object]] = []
+    for left_svid, right_svid in combinations(present, 2):
+        difference = wrap_cycles(
+            single_difference_cycles[columns[left_svid]]
+            - single_difference_cycles[columns[right_svid]]
+        ).abs().dropna()
+        rows.append(
+            {
+                "pair": f"{left_svid}-{right_svid}",
+                "left_svid": left_svid,
+                "right_svid": right_svid,
+                "epoch_count": int(len(difference)),
+                "median_abs_wrapped_sd_diff_cycles": (
+                    float(difference.median()) if len(difference) else np.nan
+                ),
+                "p90_abs_wrapped_sd_diff_cycles": (
+                    float(difference.quantile(0.9)) if len(difference) else np.nan
+                ),
+            }
+        )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "pair",
+            "left_svid",
+            "right_svid",
+            "epoch_count",
+            "median_abs_wrapped_sd_diff_cycles",
+            "p90_abs_wrapped_sd_diff_cycles",
+        ],
+    )
 
 
 def compute_pairwise_aoa_convergence(
@@ -1896,6 +2408,7 @@ def reconstruct_multi_reference_aoa(
     branch_values: Iterable[int] = (-2, -1, 0, 1, 2),
     baseline_over_wavelength: float = 1.0,
     branch_selection_method: str = "dp",
+    branch_metric: str = "aoa_deg",
 ) -> pd.DataFrame:
     """Reconstruct DD AoAs for every eligible DD reference.
 
@@ -1904,11 +2417,16 @@ def reconstruct_multi_reference_aoa(
     the constant branch with the smallest median AoA error to that satellite's ephemeris track.
     Best-m uses no authenticity labels, but is an ephemeris-assisted diagnostic rather than an
     independent spoof detector because the same ephemeris is later used in the residual.
+
+    ``branch_metric`` is passed to :func:`select_aoa_dp`. It defaults to the legacy degree
+    metric so the DP-versus-best-m comparison in the pairwise classifier notebooks keeps its
+    recorded behaviour; the paper flow uses ``"direction_cosine"``.
     """
     if min_target_epochs < 1:
         raise ValueError("min_target_epochs must be at least 1.")
     if branch_selection_method not in {"dp", "best_m"}:
         raise ValueError("branch_selection_method must be 'dp' or 'best_m'.")
+    _validate_branch_metric(branch_metric)
 
     single_difference = sort_svid_columns(single_difference_cycles)
     ephemeris = sort_svid_columns(ephemeris_aoa_deg).reindex(single_difference.index)
@@ -1956,6 +2474,7 @@ def reconstruct_multi_reference_aoa(
                 reference_svid=reference_svid,
                 reference_angle_deg=reference_aoa,
                 return_branches=True,
+                metric=branch_metric,
             )
         else:
             selected_aoa, selected_branch_by_svid = select_aoa_by_reference(
@@ -2616,6 +3135,537 @@ def classify_pairwise_geometry(
     return scores, residual_matrix, consistency_matrix
 
 
+UBX_KEY_MESSAGES = ("RXM-RAWX", "NAV-PVT", "NAV-SAT", "NAV-SIG", "RXM-SFRBX")
+
+
+def compute_navsat_geometry_by_synced_epoch(
+    epochs: pd.DataFrame,
+    navsat: pd.DataFrame,
+    *,
+    epoch_tow_column: str,
+    navsat_tow_decimals: int = 0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """NAV-SAT elevation and azimuth (deg) per synchronized epoch and SVID."""
+    epoch_index = pd.Index(epochs["epoch_index"].astype(int), name="epoch_index")
+    if navsat.empty:
+        empty = pd.DataFrame(index=epoch_index)
+        return empty, empty.copy()
+    matched = _navsat_epoch_merge(
+        epochs,
+        navsat,
+        epoch_tow_column=epoch_tow_column,
+        navsat_tow_decimals=navsat_tow_decimals,
+    )
+    matched = matched.dropna(subset=["svid", "elev", "azim"]).copy()
+    if matched.empty:
+        empty = pd.DataFrame(index=epoch_index)
+        return empty, empty.copy()
+    matched = _drop_invalid_navsat_geometry(matched)
+    matched["svid"] = matched["svid"].astype(int)
+    elevation = matched.pivot_table(
+        index="epoch_index", columns="svid", values="elev", aggfunc="first"
+    ).reindex(epoch_index)
+    azimuth = matched.pivot_table(
+        index="epoch_index", columns="svid", values="azim", aggfunc="first"
+    ).reindex(epoch_index)
+    return sort_svid_columns(elevation), sort_svid_columns(azimuth)
+
+
+@dataclass
+class BaselineAzimuthFit:
+    """Antenna-baseline azimuth (and D/lambda) fitted from the authentic satellites."""
+
+    authentic_svids: tuple[int, ...]
+    baseline_over_wavelength: float
+    configured_azimuth_deg: float
+    fitted_azimuth_deg: float
+    fitted_residual_cycles: float
+    configured_residual_cycles: float
+    opposite_residual_cycles: float
+    azimuth_difference_deg: float
+    consistent: bool
+    recommendation: str
+    per_svid_residual_cycles: pd.Series
+    best_per_ratio: pd.DataFrame
+    grid: pd.DataFrame
+
+    def to_frame(self) -> pd.DataFrame:
+        """One-row summary for display next to the configured rig parameters."""
+        return pd.DataFrame(
+            [
+                {
+                    "authentic_svids": ",".join(str(svid) for svid in self.authentic_svids),
+                    "baseline_over_wavelength": self.baseline_over_wavelength,
+                    "configured_azimuth_deg": self.configured_azimuth_deg,
+                    "fitted_azimuth_deg": self.fitted_azimuth_deg,
+                    "azimuth_difference_deg": self.azimuth_difference_deg,
+                    "fitted_residual_cycles": self.fitted_residual_cycles,
+                    "configured_residual_cycles": self.configured_residual_cycles,
+                    "opposite_residual_cycles": self.opposite_residual_cycles,
+                    "consistent": self.consistent,
+                    "recommendation": self.recommendation,
+                }
+            ]
+        )
+
+
+def fit_baseline_azimuth(
+    single_difference_cycles: pd.DataFrame,
+    navsat_elev_deg: pd.DataFrame,
+    navsat_azim_deg: pd.DataFrame,
+    *,
+    exclude_svids: Sequence[int] | None = None,
+    min_epochs: int = 50,
+    baseline_over_wavelength: float = 1.0,
+    ratio_grid: Sequence[float] = (0.9, 0.95, 1.0, 1.05, 1.1),
+    azimuth_step_deg: float = 1.0,
+    configured_azimuth_deg: float = 0.0,
+    azimuth_tolerance_deg: float = 30.0,
+) -> BaselineAzimuthFit:
+    """Fit the antenna-baseline azimuth from the authentic satellites.
+
+    For authentic PRNs ``i, j`` the wrapped inter-satellite double difference must equal
+    ``wrap(k (cos a_i - cos a_j))`` with ``cos a = cos(el) cos(az - az_b)``; this uses no
+    reference satellite, no reference-angle anchor and no Eq. 21 branch. A grid search over
+    ``az_b`` (and over the D/lambda values in ``ratio_grid``) reports the azimuth that fits
+    the single differences *as computed with the configured receiver order*. A fit near
+    ``configured_azimuth_deg`` confirms the rig polarity; a fit near ``configured + 180``
+    means the receivers are wired the other way round (set ``navsat_azimuth_bias_deg`` to
+    the fitted value or swap ``single_difference_order``). Random data give a median
+    residual near 0.25 cycles; this rig fits at 0.05-0.09 cycles.
+    """
+    if min_epochs < 1:
+        raise ValueError("min_epochs must be at least 1.")
+    if baseline_over_wavelength <= 0:
+        raise ValueError("baseline_over_wavelength must be positive.")
+    excluded = set(_normalise_svids(exclude_svids) or ())
+    single_difference = sort_svid_columns(single_difference_cycles)
+    elevation = sort_svid_columns(navsat_elev_deg).reindex(single_difference.index)
+    azimuth = sort_svid_columns(navsat_azim_deg).reindex(single_difference.index)
+    authentic = [
+        int(svid)
+        for svid in single_difference.columns
+        if int(svid) not in excluded
+        and int(svid) in elevation.columns
+        and int(svid) in azimuth.columns
+        and int(
+            (
+                single_difference[svid].notna()
+                & elevation[int(svid)].notna()
+                & azimuth[int(svid)].notna()
+            ).sum()
+        )
+        >= min_epochs
+    ]
+    if len(authentic) < 3:
+        raise ValueError(
+            f"Need at least 3 authentic PRNs with >= {min_epochs} epochs of single "
+            f"difference and NAV-SAT geometry; found {authentic}."
+        )
+
+    measured_sd = single_difference[authentic].to_numpy(dtype=float)
+    elevation_rad = np.deg2rad(elevation[authentic].to_numpy(dtype=float))
+    azimuth_rad = np.deg2rad(azimuth[authentic].to_numpy(dtype=float))
+    pairs = list(combinations(range(len(authentic)), 2))
+    left = [pair[0] for pair in pairs]
+    right = [pair[1] for pair in pairs]
+    measured = measured_sd[:, left] - measured_sd[:, right]
+
+    def residuals(azimuth_deg: float, ratio: float) -> np.ndarray:
+        cos_alpha = np.cos(elevation_rad) * np.cos(azimuth_rad - np.deg2rad(azimuth_deg))
+        expected = cos_alpha[:, left] - cos_alpha[:, right]
+        return np.abs(wrap_cycles(measured - ratio * expected))
+
+    def median_residual(values: np.ndarray) -> float:
+        finite = values[np.isfinite(values)]
+        return float(np.median(finite)) if finite.size else float("nan")
+
+    azimuth_grid = np.arange(0.0, 360.0, float(azimuth_step_deg))
+    ratios = sorted({float(ratio) for ratio in ratio_grid} | {float(baseline_over_wavelength)})
+    rows: list[dict[str, float]] = []
+    for ratio in ratios:
+        for azimuth_deg in azimuth_grid:
+            values = residuals(float(azimuth_deg), ratio)
+            finite = values[np.isfinite(values)]
+            rows.append(
+                {
+                    "baseline_over_wavelength": ratio,
+                    "azimuth_deg": float(azimuth_deg),
+                    "median_abs_residual_cycles": median_residual(values),
+                    "pct_le_0p05_cycles": (
+                        float(100.0 * np.mean(finite <= 0.05)) if finite.size else float("nan")
+                    ),
+                }
+            )
+    grid = pd.DataFrame(rows)
+    best_per_ratio = grid.loc[
+        grid.groupby("baseline_over_wavelength")["median_abs_residual_cycles"].idxmin()
+    ].reset_index(drop=True)
+    at_ratio = grid.loc[grid["baseline_over_wavelength"].eq(float(baseline_over_wavelength))]
+    best = at_ratio.loc[at_ratio["median_abs_residual_cycles"].idxmin()]
+    fitted_azimuth = float(best["azimuth_deg"])
+    fitted_residual = float(best["median_abs_residual_cycles"])
+    configured = float(configured_azimuth_deg) % 360.0
+    configured_residual = median_residual(residuals(configured, float(baseline_over_wavelength)))
+    opposite_residual = median_residual(
+        residuals((configured + 180.0) % 360.0, float(baseline_over_wavelength))
+    )
+    best_values = residuals(fitted_azimuth, float(baseline_over_wavelength))
+    per_svid = {}
+    for position, svid in enumerate(authentic):
+        columns = [index for index, pair in enumerate(pairs) if position in pair]
+        per_svid[svid] = median_residual(best_values[:, columns])
+    per_svid_residual = pd.Series(per_svid, name="median_abs_residual_cycles")
+    per_svid_residual.index.name = "svid"
+
+    difference = ((fitted_azimuth - configured + 180.0) % 360.0) - 180.0
+    if abs(difference) <= azimuth_tolerance_deg:
+        consistent = True
+        recommendation = (
+            f"configured baseline azimuth {configured:.0f} deg is consistent with the "
+            f"authentic PRNs (fit {fitted_azimuth:.0f} deg, median residual "
+            f"{fitted_residual:.3f} cycles at the fit, {configured_residual:.3f} as configured)."
+        )
+    elif abs(abs(difference) - 180.0) <= azimuth_tolerance_deg:
+        consistent = False
+        recommendation = (
+            f"receivers are wired the other way round: the authentic PRNs fit baseline "
+            f"azimuth {fitted_azimuth:.0f} deg, not {configured:.0f} deg (residual "
+            f"{fitted_residual:.3f} vs {configured_residual:.3f} cycles). Set "
+            f"navsat_azimuth_bias_deg={fitted_azimuth:.0f}, or keep the bias and swap "
+            f"single_difference_order. Absolute angles computed with the current setting "
+            f"are wrong."
+        )
+    else:
+        consistent = False
+        recommendation = (
+            f"the authentic PRNs fit baseline azimuth {fitted_azimuth:.0f} deg, "
+            f"{difference:+.0f} deg from the configured {configured:.0f} deg (residual "
+            f"{fitted_residual:.3f} vs {configured_residual:.3f} cycles). Set "
+            f"navsat_azimuth_bias_deg={fitted_azimuth:.0f} before reading absolute angles."
+        )
+    return BaselineAzimuthFit(
+        authentic_svids=tuple(authentic),
+        baseline_over_wavelength=float(baseline_over_wavelength),
+        configured_azimuth_deg=configured,
+        fitted_azimuth_deg=fitted_azimuth,
+        fitted_residual_cycles=fitted_residual,
+        configured_residual_cycles=configured_residual,
+        opposite_residual_cycles=opposite_residual,
+        azimuth_difference_deg=float(difference),
+        consistent=consistent,
+        recommendation=recommendation,
+        per_svid_residual_cycles=per_svid_residual,
+        best_per_ratio=best_per_ratio,
+        grid=grid,
+    )
+
+
+def _true_segments(mask: pd.Series) -> list[tuple[int, int]]:
+    segments: list[tuple[int, int]] = []
+    start: int | None = None
+    previous: int | None = None
+    for index, flag in mask.items():
+        index = int(index)
+        if bool(flag):
+            if start is None:
+                start = index
+            previous = index
+        elif start is not None:
+            segments.append((start, int(previous)))
+            start = None
+    if start is not None:
+        segments.append((start, int(previous)))
+    return segments
+
+
+def _describe_segments(segments: Sequence[tuple[int, int]], tow: pd.Series | None) -> str:
+    parts: list[str] = []
+    for first, last in segments:
+        count = last - first + 1
+        if tow is not None and first in tow.index and last in tow.index:
+            parts.append(f"TOW {tow.loc[first]:.0f}-{tow.loc[last]:.0f} ({count} ep)")
+        else:
+            parts.append(f"epochs {first}-{last} ({count} ep)")
+    return "; ".join(parts)
+
+
+@dataclass
+class CaptureProbe:
+    """Data check of a two-receiver capture before the DD-method AoA flow."""
+
+    receiver1_path: Path
+    receiver2_path: Path
+    spoof_svids: tuple[int, ...]
+    message_inventory: pd.DataFrame
+    observations: tuple[UbxObservationTables, UbxObservationTables]
+    synced: SyncedObservations | None
+    carrier_phase: CarrierPhaseTables | None
+    common_valid_phase: pd.DataFrame
+    receiver_svid_summary: pd.DataFrame
+    spoof_phase_summary: pd.DataFrame
+    usable_spoof_svids: tuple[int, ...]
+    all_spoof_valid_epoch_count: int
+    longest_all_spoof_valid_run: int
+    problems: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.problems
+
+    def raise_for_problems(self) -> None:
+        if self.problems:
+            raise ValueError(
+                "Capture is not usable for the DD-method AoA flow:\n- "
+                + "\n- ".join(self.problems)
+            )
+
+
+def probe_capture(
+    receiver1_path: str | Path,
+    receiver2_path: str | Path,
+    *,
+    spoof_svids: Sequence[int] | None = None,
+    gnss_id: int = 0,
+    sig_id: int = 0,
+    sync_tow_decimals: int | None = 0,
+    use_navpvt_time_correction: bool = True,
+    navpvt_tow_decimals: int = 0,
+    thin_window_epochs: int = 5,
+    min_window_epochs: int = 2,
+) -> CaptureProbe:
+    """Check that a two-receiver capture can feed the DD-method AoA flow.
+
+    Reports the UBX message inventory per receiver, per-PRN tracking quality (RAWX rows,
+    rows with ``cpValid=1`` and ``halfCyc=1``, C/N0, lock time, ``svUsed``, NAV-SAT
+    geometry) and, for the spoof group, the epochs where every spoof PRN has valid carrier
+    phase in both receivers -- the window the partial-spoof flow needs. ``problems`` lists
+    what makes the capture unusable (no RXM-RAWX, no NAV-PVT, no Receiver 1 NAV-SAT, fewer
+    than ``min_window_epochs`` continuous epochs with every usable spoof PRN valid in both
+    receivers); ``warnings`` lists what shrinks it (spoof PRNs dropped, a window shorter
+    than ``thin_window_epochs``).
+    """
+    spoof = _normalise_svids(spoof_svids) or ()
+    paths = (Path(receiver1_path), Path(receiver2_path))
+    labels = ("Receiver 1", "Receiver 2")
+    problems: list[str] = []
+    warnings: list[str] = []
+    observations = tuple(
+        read_ubx_observations(path, gnss_id=gnss_id, sig_id=sig_id) for path in paths
+    )
+
+    inventory_rows: list[dict[str, object]] = []
+    for label, path, obs in zip(labels, paths, observations):
+        row: dict[str, object] = {
+            "receiver": label,
+            "file": path.name,
+            "size_kb": round(path.stat().st_size / 1024.0, 1),
+        }
+        for key in UBX_KEY_MESSAGES:
+            row[key] = int(obs.message_counts.get(key, 0))
+        row["rawx_epochs"] = int(obs.rawx["rcvTow"].nunique()) if not obs.rawx.empty else 0
+        row["rawx_span_s"] = (
+            float(obs.rawx["rcvTow"].max() - obs.rawx["rcvTow"].min())
+            if not obs.rawx.empty
+            else 0.0
+        )
+        inventory_rows.append(row)
+        if obs.rawx.empty:
+            problems.append(
+                f"{label} ({path.name}) has no RXM-RAWX for GPS L1: it contributes no "
+                "carrier phase, so no double difference can be formed. Enable RXM-RAWX "
+                "output on that receiver."
+            )
+        elif obs.navpvt.empty and use_navpvt_time_correction:
+            problems.append(
+                f"{label} ({path.name}) has no NAV-PVT: the Eq. 8 time correction "
+                "(nano * doMes) cannot be applied and every carrier phase becomes NaN. "
+                "Enable NAV-PVT or set use_navpvt_time_correction=False."
+            )
+        if obs.navsat.empty:
+            if label == "Receiver 1":
+                problems.append(
+                    f"{label} ({path.name}) has no NAV-SAT: the reference-angle anchor and "
+                    "the ephemeris-based AoA both need Receiver 1 NAV-SAT azimuth/elevation."
+                )
+            else:
+                warnings.append(
+                    f"{label} ({path.name}) has no NAV-SAT: the Receiver 2 ephemeris "
+                    "diagnostic and svUsed timeline will be empty."
+                )
+    message_inventory = pd.DataFrame(inventory_rows).set_index("receiver")
+
+    svid_frames: list[pd.DataFrame] = []
+    for label, obs in zip(labels, observations):
+        if obs.rawx.empty:
+            continue
+        rawx = obs.rawx
+        usable = rawx["cp_valid"].fillna(0).astype(int).eq(1) & rawx["half_cycle"].fillna(
+            0
+        ).astype(int).eq(1)
+        per_svid = rawx.assign(usable_phase=usable).groupby("svid").agg(
+            rawx_rows=("cpMes", "size"),
+            usable_phase_rows=("usable_phase", "sum"),
+            mean_cno=("cno", "mean"),
+            max_locktime_s=("locktime", lambda values: float(values.max()) / 1000.0),
+        )
+        if not obs.navsat.empty:
+            navsat = obs.navsat.groupby("svid").agg(
+                sv_used_epochs=("svUsed", "sum"),
+                median_elev_deg=("elev", "median"),
+                median_azim_deg=("azim", "median"),
+            )
+            per_svid = per_svid.join(navsat, how="left")
+        per_svid.insert(0, "receiver", label)
+        per_svid["spoof"] = per_svid.index.isin(spoof)
+        svid_frames.append(per_svid.reset_index())
+    receiver_svid_summary = (
+        pd.concat(svid_frames, ignore_index=True) if svid_frames else pd.DataFrame()
+    )
+    if not receiver_svid_summary.empty:
+        receiver_svid_summary["svid"] = receiver_svid_summary["svid"].astype(int)
+
+    spoof_columns = [
+        "svid",
+        "rx1_valid_epochs",
+        "rx2_valid_epochs",
+        "common_valid_epochs",
+        "longest_common_run",
+        "usable",
+        "common_segments",
+        "rx1_segments",
+        "rx2_segments",
+    ]
+    if any(obs.rawx.empty for obs in observations):
+        return CaptureProbe(
+            receiver1_path=paths[0],
+            receiver2_path=paths[1],
+            spoof_svids=spoof,
+            message_inventory=message_inventory,
+            observations=observations,
+            synced=None,
+            carrier_phase=None,
+            common_valid_phase=pd.DataFrame(),
+            receiver_svid_summary=receiver_svid_summary,
+            spoof_phase_summary=pd.DataFrame(columns=spoof_columns),
+            usable_spoof_svids=(),
+            all_spoof_valid_epoch_count=0,
+            longest_all_spoof_valid_run=0,
+            problems=problems,
+            warnings=warnings,
+        )
+
+    try:
+        synced = sync_receiver_epochs(
+            observations[0], observations[1], tow_round_decimals=sync_tow_decimals
+        )
+    except ValueError as error:
+        problems.append(f"receiver synchronization failed: {error}")
+        return CaptureProbe(
+            receiver1_path=paths[0],
+            receiver2_path=paths[1],
+            spoof_svids=spoof,
+            message_inventory=message_inventory,
+            observations=observations,
+            synced=None,
+            carrier_phase=None,
+            common_valid_phase=pd.DataFrame(),
+            receiver_svid_summary=receiver_svid_summary,
+            spoof_phase_summary=pd.DataFrame(columns=spoof_columns),
+            usable_spoof_svids=(),
+            all_spoof_valid_epoch_count=0,
+            longest_all_spoof_valid_run=0,
+            problems=problems,
+            warnings=warnings,
+        )
+    carrier_phase = build_carrier_phase_table(
+        synced,
+        use_navpvt_time_correction=use_navpvt_time_correction,
+        navpvt_tow_decimals=navpvt_tow_decimals,
+    )
+    common_valid = carrier_phase.rx1_cycles.notna() & carrier_phase.rx2_cycles.notna()
+    tow = synced.epochs.set_index("epoch_index")["rcvTow_rx1"]
+    false_column = pd.Series(False, index=common_valid.index)
+
+    spoof_rows: list[dict[str, object]] = []
+    for svid in spoof:
+        rx1_valid = (
+            carrier_phase.rx1_cycles[svid].notna()
+            if svid in carrier_phase.rx1_cycles.columns
+            else false_column
+        )
+        rx2_valid = (
+            carrier_phase.rx2_cycles[svid].notna()
+            if svid in carrier_phase.rx2_cycles.columns
+            else false_column
+        )
+        both = common_valid[svid] if svid in common_valid.columns else false_column
+        spoof_rows.append(
+            {
+                "svid": int(svid),
+                "rx1_valid_epochs": int(rx1_valid.sum()),
+                "rx2_valid_epochs": int(rx2_valid.sum()),
+                "common_valid_epochs": int(both.sum()),
+                "longest_common_run": len(longest_valid_epoch_segment(both)),
+                "usable": bool(both.any()),
+                "common_segments": _describe_segments(_true_segments(both), tow),
+                "rx1_segments": _describe_segments(_true_segments(rx1_valid), tow),
+                "rx2_segments": _describe_segments(_true_segments(rx2_valid), tow),
+            }
+        )
+    spoof_phase_summary = pd.DataFrame(spoof_rows, columns=spoof_columns)
+    usable_spoof = tuple(int(row["svid"]) for row in spoof_rows if row["usable"])
+    dropped = [svid for svid in spoof if svid not in usable_spoof]
+    if spoof and not usable_spoof:
+        problems.append(
+            f"no spoof PRN of {list(spoof)} has valid carrier phase (cpValid=1, halfCyc=1) "
+            "in both receivers at the same epoch; there is nothing to estimate. Check lock "
+            "time and halfCyc in receiver_svid_summary."
+        )
+    elif dropped:
+        warnings.append(
+            f"spoof PRNs {dropped} never have common valid phase and are dropped from the "
+            f"group; the flow continues with {list(usable_spoof)}."
+        )
+    if usable_spoof:
+        all_valid = common_valid.reindex(columns=list(usable_spoof)).all(axis=1)
+    else:
+        all_valid = false_column
+    all_valid_count = int(all_valid.sum())
+    longest_run = len(longest_valid_epoch_segment(all_valid))
+    if usable_spoof and longest_run < min_window_epochs:
+        problems.append(
+            f"only {longest_run} continuous epoch(s) have every usable spoof PRN "
+            f"{list(usable_spoof)} valid in both receivers at the same time; the joint-source "
+            f"selection needs at least {min_window_epochs}. Check lock time and halfCyc in "
+            "receiver_svid_summary."
+        )
+    elif usable_spoof and longest_run < thin_window_epochs:
+        warnings.append(
+            f"only {longest_run} continuous epoch(s) have every usable spoof PRN valid in "
+            "both receivers; the AoA window will be thin."
+        )
+
+    return CaptureProbe(
+        receiver1_path=paths[0],
+        receiver2_path=paths[1],
+        spoof_svids=spoof,
+        message_inventory=message_inventory,
+        observations=observations,
+        synced=synced,
+        carrier_phase=carrier_phase,
+        common_valid_phase=common_valid,
+        receiver_svid_summary=receiver_svid_summary,
+        spoof_phase_summary=spoof_phase_summary,
+        usable_spoof_svids=usable_spoof,
+        all_spoof_valid_epoch_count=all_valid_count,
+        longest_all_spoof_valid_run=longest_run,
+        problems=problems,
+        warnings=warnings,
+    )
+
+
 def run_dataset(config: DatasetConfig) -> AoaRunResult:
     """Run one DD-method AoA analysis from UBX files through collapse metrics."""
     read_limit = None
@@ -2707,6 +3757,7 @@ def run_dataset(config: DatasetConfig) -> AoaRunResult:
             reference_svid=reference_svid,
             reference_angle_deg=config.alpha_r_deg,
             return_branches=True,
+            metric=config.branch_metric,
         )
         aoa_metrics_by_epoch, aoa_metrics_summary = compute_collapse_metrics(
             selected_aoa
@@ -3175,6 +4226,120 @@ def plot_aoa_tracks(
     return fig
 
 
+def plot_spoof_branch_summary(
+    detection: pd.DataFrame,
+    *,
+    prior_aoa_deg: float | None = None,
+    cluster_median_aoa_deg: float | None = None,
+    title: str = "Spoof PRNs: DD-method AoA on both Eq. 21 branches vs ephemeris-based AoA",
+):
+    """Per spoof PRN: selected and alternative branch (median +- std), ephemeris +- threshold."""
+    plt = _import_pyplot()
+    fig, ax = plt.subplots(figsize=(max(6.5, 1.7 * len(detection) + 3.5), 5.0))
+    if detection.empty:
+        ax.set_title(title)
+        ax.text(0.5, 0.5, "No spoof PRN detection table", ha="center", va="center")
+        ax.axis("off")
+        return fig
+
+    threshold = float(detection["threshold_deg"].iloc[0])
+    positions = np.arange(len(detection))
+    for position, row in zip(positions, detection.itertuples()):
+        if np.isfinite(row.ephemeris_aoa_deg):
+            ax.fill_between(
+                [position - 0.3, position + 0.3],
+                row.ephemeris_aoa_deg - threshold,
+                row.ephemeris_aoa_deg + threshold,
+                color="#2c7fb8",
+                alpha=0.12,
+                label=f"ephemeris-based AoA +- {threshold:.0f} deg" if position == 0 else None,
+            )
+            ax.plot(
+                position,
+                row.ephemeris_aoa_deg,
+                marker="x",
+                color="#2c7fb8",
+                ms=10,
+                mew=2,
+                ls="none",
+                label="ephemeris-based AoA (real satellite)" if position == 0 else None,
+                zorder=2,
+            )
+        if np.isfinite(row.selected_aoa_deg):
+            ax.errorbar(
+                position,
+                row.selected_aoa_deg,
+                yerr=row.selected_std_deg if np.isfinite(row.selected_std_deg) else 0.0,
+                fmt="o",
+                color="#d7301f",
+                capsize=3,
+                ms=7,
+                label=(
+                    f"DD-method AoA, selected branch (chosen_by = {row.chosen_by})"
+                    if position == 0
+                    else None
+                ),
+                zorder=3,
+            )
+            ax.annotate(
+                f"m={int(row.selected_m)}",
+                (position, row.selected_aoa_deg),
+                xytext=(7, 4),
+                textcoords="offset points",
+                fontsize=8,
+                color="#d7301f",
+            )
+        if np.isfinite(row.alternative_aoa_deg):
+            ax.errorbar(
+                position,
+                row.alternative_aoa_deg,
+                yerr=(
+                    row.alternative_std_deg if np.isfinite(row.alternative_std_deg) else 0.0
+                ),
+                fmt="s",
+                color="#fdae6b",
+                capsize=3,
+                ms=7,
+                label="DD-method AoA, alternative Eq. 21 branch" if position == 0 else None,
+                zorder=3,
+            )
+            ax.annotate(
+                f"m={int(row.alternative_m)}",
+                (position, row.alternative_aoa_deg),
+                xytext=(7, 4),
+                textcoords="offset points",
+                fontsize=8,
+                color="#b35806",
+            )
+    if cluster_median_aoa_deg is not None and np.isfinite(cluster_median_aoa_deg):
+        ax.axhline(
+            float(cluster_median_aoa_deg),
+            color="#d7301f",
+            lw=0.8,
+            ls="--",
+            alpha=0.7,
+            label=f"cluster median {float(cluster_median_aoa_deg):.1f} deg",
+        )
+    if prior_aoa_deg is not None and np.isfinite(prior_aoa_deg):
+        ax.axhline(
+            float(prior_aoa_deg),
+            color="#636363",
+            lw=1.0,
+            ls=":",
+            label=f"declared prior {float(prior_aoa_deg):.0f} deg",
+        )
+    ax.set_xticks(positions, [f"PRN {int(svid)}" for svid in detection["svid"]])
+    ax.set_xlim(-0.6, len(detection) - 0.4)
+    ax.set_ylim(0, 180)
+    ax.set_yticks(range(0, 181, 30))
+    ax.set_ylabel("Baseline-relative AoA (deg)")
+    ax.grid(True, alpha=0.25)
+    ax.legend(fontsize=8, loc="best")
+    ax.set_title(title)
+    fig.tight_layout()
+    return fig
+
+
 def plot_sv_used_timeline(
     sv_used_by_receiver: dict[str, pd.DataFrame],
     *,
@@ -3336,6 +4501,8 @@ def _paper_scenario_summary(
     reference_alpha_deg: float | None,
     source_epoch_start: int,
     sv_used_summary: pd.DataFrame,
+    prior_aoa_deg: float | None = None,
+    joint_source_ambiguity: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     rows = [
         {
@@ -3346,6 +4513,10 @@ def _paper_scenario_summary(
             "reference_svid": analysis_result.reference_svid,
             "reference_alpha_deg": reference_alpha_deg,
             "navsat_azimuth_bias_deg": config.navsat_azimuth_bias_deg,
+            "single_difference_order": config.single_difference_order,
+            "baseline_over_wavelength": config.baseline_over_wavelength,
+            "branch_metric": config.branch_metric,
+            "prior_aoa_deg": prior_aoa_deg,
             "source_epoch_start": int(source_epoch_start),
             "analysis_epoch_count": len(analysis_result.epochs),
             "all_satellite_dd_tracks": int(
@@ -3354,6 +4525,17 @@ def _paper_scenario_summary(
             "output_dir": str(analysis_result.config.output_dir),
         }
     ]
+    if joint_source_ambiguity is not None and not joint_source_ambiguity.empty:
+        first = joint_source_ambiguity.iloc[0]
+        rows[0].update(
+            {
+                "joint_source_chosen_by": str(first["chosen_by"]),
+                "joint_source_ambiguous": bool(first["ambiguous"]),
+                "joint_source_selected_branches": str(first["selected_branches"]),
+                "joint_source_alternative_branches": str(first["alternative_branches"]),
+                "joint_source_tie_tolerance": float(first["tie_tolerance"]),
+            }
+        )
     for row in sv_used_summary.itertuples():
         rows[0][f"rx_{row.receiver}_sv{int(row.svid)}_used_epoch_count"] = int(
             row.used_epoch_count
@@ -3368,8 +4550,19 @@ def run_paper_scenario(
     spoof_svids: Sequence[int] | None = None,
     convergence_threshold_deg: float = 5.0,
     save_outputs: bool = True,
+    prior_aoa_deg: float | None = None,
+    tie_tolerance: float | None = None,
+    detection_threshold_deg: float = 10.0,
 ) -> PaperScenarioResult:
-    """Run one paper-style AoA flow for all-spoof or partial-spoof scenarios."""
+    """Run one paper-style AoA flow for all-spoof or partial-spoof scenarios.
+
+    In the partial-spoof flow the spoof PRNs' Eq. 21 branches are selected jointly with
+    :func:`select_joint_source_aoa` using ``config.branch_metric``. ``prior_aoa_deg`` is the
+    declared prior that breaks the one-wavelength branch tie (``None`` reports the tie as
+    unresolved), ``tie_tolerance`` overrides its automatic tolerance, and
+    ``detection_threshold_deg`` is the paper's AoA-difference threshold used in the
+    per-PRN detection table (``spoof_branch_detection``).
+    """
     normalized_spoof_svids = _normalise_svids(spoof_svids) or ()
     output_dir = config.output_dir
 
@@ -3398,6 +4591,9 @@ def run_paper_scenario(
     reference_alpha_by_epoch = pd.DataFrame()
     joint_source_aoa = pd.DataFrame()
     joint_source_branch = pd.DataFrame()
+    joint_source_ambiguity = pd.DataFrame()
+    spoof_branch_candidates = pd.DataFrame()
+    spoof_branch_detection = pd.DataFrame()
     pairwise_convergence = pd.DataFrame()
     cluster_summary = pd.DataFrame()
     reference_alpha_deg: float | None = config.alpha_r_deg
@@ -3487,10 +4683,19 @@ def run_paper_scenario(
         save_artifacts(analysis_result)
 
     if partial_spoof_enabled:
-        joint_source_aoa, joint_source_branch = select_joint_source_aoa(
-            analysis_result.candidate_aoa_deg,
-            normalized_spoof_svids,
-            return_branches=True,
+        joint_source_aoa, joint_source_branch, joint_source_ambiguity = (
+            select_joint_source_aoa(
+                analysis_result.candidate_aoa_deg,
+                normalized_spoof_svids,
+                metric=config.branch_metric,
+                prior_aoa_deg=prior_aoa_deg,
+                tie_tolerance=tie_tolerance,
+                return_branches=True,
+                return_ambiguity=True,
+            )
+        )
+        spoof_branch_candidates = summarize_branch_candidates(
+            analysis_result.candidate_aoa_deg, normalized_spoof_svids
         )
         pairwise_convergence = compute_pairwise_aoa_convergence(
             joint_source_aoa,
@@ -3557,6 +4762,31 @@ def run_paper_scenario(
         ephemeris_aligned_branch=ephemeris_aligned_branch_series,
     )
 
+    if partial_spoof_enabled and not joint_source_branch.empty:
+        selected_branch_by_svid = {
+            int(svid): int(joint_source_branch[svid].dropna().mode().iloc[0])
+            for svid in joint_source_branch.columns
+            if joint_source_branch[svid].notna().any()
+        }
+        alternative_branch_by_svid = None
+        chosen_by = "unresolved"
+        if not joint_source_ambiguity.empty:
+            first = joint_source_ambiguity.iloc[0]
+            chosen_by = str(first["chosen_by"])
+            if np.isfinite(float(first["alternative_shift"])):
+                shift = int(first["alternative_shift"])
+                alternative_branch_by_svid = {
+                    svid: branch + shift for svid, branch in selected_branch_by_svid.items()
+                }
+        spoof_branch_detection = summarize_spoof_branch_detection(
+            spoof_branch_candidates,
+            ephemeris_aoa_rx1,
+            selected_branch_by_svid=selected_branch_by_svid,
+            alternative_branch_by_svid=alternative_branch_by_svid,
+            chosen_by=chosen_by,
+            threshold_deg=detection_threshold_deg,
+        )
+
     run_summary = _paper_scenario_summary(
         config=config,
         partial_spoof_enabled=partial_spoof_enabled,
@@ -3566,6 +4796,8 @@ def run_paper_scenario(
         reference_alpha_deg=reference_alpha_deg,
         source_epoch_start=source_epoch_start,
         sv_used_summary=sv_used_summary,
+        prior_aoa_deg=prior_aoa_deg,
+        joint_source_ambiguity=joint_source_ambiguity,
     )
 
     scenario_result = PaperScenarioResult(
@@ -3593,6 +4825,10 @@ def run_paper_scenario(
         sv_used_rx2=sv_used_rx2,
         sv_used_summary=sv_used_summary,
         run_summary=run_summary,
+        joint_source_ambiguity=joint_source_ambiguity,
+        spoof_branch_candidates=spoof_branch_candidates,
+        spoof_branch_detection=spoof_branch_detection,
+        prior_aoa_deg=prior_aoa_deg,
     )
     if save_outputs:
         scenario_result.output_paths = save_paper_scenario_artifacts(
@@ -3629,6 +4865,13 @@ def save_paper_scenario_artifacts(
         ),
         ("paper_spoof_pairwise_convergence.csv", scenario.pairwise_convergence, False),
         ("paper_spoof_cluster_summary.csv", scenario.cluster_summary, False),
+        (
+            "paper_spoof_joint_source_ambiguity.csv",
+            scenario.joint_source_ambiguity,
+            False,
+        ),
+        ("paper_spoof_branch_candidates.csv", scenario.spoof_branch_candidates, False),
+        ("paper_spoof_branch_detection.csv", scenario.spoof_branch_detection, False),
         (
             "paper_all_satellite_dd_method_aoa_deg.csv",
             scenario.all_satellite_dd_method_aoa_deg,
@@ -3708,6 +4951,18 @@ def save_paper_scenario_artifacts(
             ),
         ),
         (
+            "paper_spoof_branch_summary.png",
+            lambda: plot_spoof_branch_summary(
+                scenario.spoof_branch_detection,
+                prior_aoa_deg=scenario.prior_aoa_deg,
+                cluster_median_aoa_deg=(
+                    float(scenario.cluster_summary["median_aoa_deg"].iloc[0])
+                    if not scenario.cluster_summary.empty
+                    else None
+                ),
+            ),
+        ),
+        (
             "paper_all_satellite_dd_method_aoa.png",
             lambda: plot_aoa_tracks(
                 scenario.all_satellite_dd_method_aoa_deg,
@@ -3781,6 +5036,11 @@ def save_paper_scenario_artifacts(
         if (
             filename == "paper_spoof_joint_source_dd_method_aoa.png"
             and scenario.joint_source_aoa_deg.empty
+        ):
+            continue
+        if (
+            filename == "paper_spoof_branch_summary.png"
+            and scenario.spoof_branch_detection.empty
         ):
             continue
         fig = plotter()

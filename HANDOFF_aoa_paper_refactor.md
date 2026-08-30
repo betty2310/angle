@@ -5,7 +5,67 @@ Written 2026-08-30 at the end of a session that processed the `dataset/sp-partia
 `aoa_pipeline.py`. Domain vocabulary is in `CONTEXT.md`; the paper digest is in
 `gnss_aoa_paper_methodology_context.md`.
 
-## 1. State of the working tree
+## 0. Status after the refactor session (2026-08-30)
+
+Everything below §0 is the state *before* the refactor and is kept as the record of why.
+Done on branch `aoa-paper-lean-refactor`:
+
+- **§4 implemented** in `aoa_pipeline.py`. `select_joint_source_aoa(candidates, svids, *,
+  metric="direction_cosine", prior_aoa_deg=None, prior_weight=1.0, tie_tolerance=None,
+  return_branches=False, return_ambiguity=False)` scores spread and step in direction cosine,
+  evaluates every uniform branch shift of the DP path, and records `chosen_by` in a per-epoch
+  ambiguity table (`data` → `prior` → `unresolved`; unresolved reports the smallest-|m| fully
+  valid combination and lists the alternative). `select_aoa_dp` / `_dp_select_segment` take the
+  same `metric` (`DatasetConfig.branch_metric`, default `direction_cosine`, exact ties → smallest
+  |m|); `reconstruct_multi_reference_aoa` keeps `branch_metric="aoa_deg"` so the pairwise
+  classifier notebooks are unchanged. New: `summarize_branch_candidates`,
+  `summarize_spoof_branch_detection` (both branches vs ephemeris, `spoof_flag_selected`,
+  `spoof_flag_all_branches`), `plot_spoof_branch_summary`, `fit_baseline_azimuth`
+  (+ `compute_navsat_geometry_by_synced_epoch`), `probe_capture`,
+  `summarize_pairwise_single_difference_collapse`. `run_paper_scenario(prior_aoa_deg=,
+  tie_tolerance=, detection_threshold_deg=)` returns `joint_source_ambiguity`,
+  `spoof_branch_candidates`, `spoof_branch_detection` and writes
+  `paper_spoof_joint_source_ambiguity.csv`, `paper_spoof_branch_candidates.csv`,
+  `paper_spoof_branch_detection.csv`, `paper_spoof_branch_summary.png`.
+- **Tie rule as implemented** (differs from the §4 sketch): uniformly shifted combinations have
+  *identical* spread and step costs wherever both are valid, so comparing DP totals only measures
+  the boundary effect (v9's mirror sits at cos α ≈ ±1 and is "invalid" at half the epochs from
+  noise alone, which is not evidence about m). An alternative therefore counts as tied when its
+  direction cosines leave [−1, 1] by at most `tie_tolerance` on average over the window
+  (`None` → 3× the median per-epoch spread + step in cos, floor 0.01). `chosen_by="data"` occurs
+  when no shift is tied (D = λ/2, or a rig rotated through broadside during the capture).
+- **Tests**: `test_aoa_branch_selection.py` (the four §4 tests plus DP tie-break, detection
+  flags, azimuth fit, SD collapse). `uv run python -m unittest` → 30 tests pass.
+- **§5 implemented**: `AOA_Paper.ipynb` is the lean notebook (16 cells: configuration → data
+  check → rig check → run → result → diagnostics → outputs/validation), committed executed on v4
+  with `PRIOR_AOA_DEG = None`. The previous notebook (2026-08-10 full-spoof closed-room
+  configuration, labelled classifier sections) is in git history, commit "snapshot: …".
+- **Scripts**: `probe_dataset.py` and `calibrate_baseline_azimuth.py` are thin wrappers over
+  `probe_capture` / `fit_baseline_azimuth`; `run_sp_partial_28_08.py` gained `--prior`,
+  `--metric`, `--tie-tolerance`, `--detection-threshold` and prints the ambiguity and detection
+  tables.
+
+Validation, notebook re-executed with injected configuration (driver runs agree):
+
+| capture | configuration | chosen_by | selected (m) | alternative (m) | rig check |
+|---|---|---|---|---|---|
+| v4 | prior None | unresolved | 38.3° (0) | 102.5° (−1) | fit 352°, OK |
+| v4 | prior 30 | prior | 38.3° (0) | 102.5° (−1) | |
+| v5 | prior 150 | prior | 141–144° (−1) | 77–79° (0) | fit 354°, OK |
+| v5 | prior None | unresolved | 77–79° (0) | 141–144° (−1) | PRN 24 mirror passes 10° by coincidence: `spoof_flag_all_branches = False` |
+| v8 | rx1-rx2, prior 90 | prior | 87.9–88.3° (−1) | 164–166° (−2) | fit 2°, OK |
+| v8 | rx1-rx2, prior None | unresolved | 88° (−1) | 164° (−2) | |
+| v9 | rx1-rx2, prior 90 | prior | 90.0–90.2° (0) | 5–8° (+1) | fit 356°, OK |
+| v9 | rx1-rx2, prior None | unresolved | 90° (0) | 5–8° (+1) | |
+| v9 | rx2-rx1, bias 0 | unresolved | 31.7° / 98.6° (wrong, as expected) | | **warning: fit 176°, wired the other way round** |
+| v3 | | data check stops | | | only 1 continuous epoch with PRNs 10/23 valid in both receivers |
+| v1 | | data check stops | | | no RXM-RAWX on Receiver 2 |
+
+Collapse metrics of v4/v5/v8/v9 are identical to the pre-refactor runs. Open decisions in §7
+still stand, except that the manuscript package question is moot (the old cell structure is only
+in git history now) and the halfCyc gate stays strict.
+
+## 1. State of the working tree (before the refactor)
 
 Uncommitted changes that predate this session and must be kept:
 
