@@ -12,12 +12,16 @@ import pandas as pd
 from aoa_pipeline import (
     _describe_segments,
     _true_segments,
+    build_best_m_all_satellite_aoa,
     fit_baseline_azimuth,
     generate_aoa_candidates,
+    select_aoa_by_reference,
+    select_aoa_by_reference_per_epoch,
     select_aoa_dp,
     select_joint_source_aoa,
     summarize_branch_candidates,
     summarize_pairwise_single_difference_collapse,
+    summarize_per_epoch_branches,
     summarize_spoof_branch_detection,
 )
 
@@ -54,6 +58,64 @@ def synthetic_candidates(
 
 
 class JointSourceBranchSelectionTests(unittest.TestCase):
+    def test_explicit_m_selects_v4_and_v5_branches_without_resolving_ambiguity(self):
+        for source_angle, anchor, branch in [(38.3, 66.6, 0), (143.0, 62.1, -1)]:
+            with self.subTest(branch=branch):
+                candidates = synthetic_candidates(
+                    source_aoa_deg=source_angle, reference_aoa_deg=anchor
+                )
+                selected, branches, ambiguity = select_joint_source_aoa(
+                    candidates, SPOOF_SVIDS, fixed_m=branch,
+                    return_branches=True, return_ambiguity=True,
+                )
+                self.assertTrue(branches.eq(branch).all().all())
+                self.assertTrue(ambiguity["chosen_by"].eq("explicit_m").all())
+                self.assertTrue(ambiguity["ambiguous"].all())
+                self.assertTrue(ambiguity["fixed_m"].eq(branch).all())
+                self.assertAlmostEqual(float(selected.median().median()), source_angle, delta=1.5)
+                expected = candidates.loc[candidates["branch"].eq(branch)].pivot(
+                    index="epoch_index", columns="svid", values="candidate_aoa_deg"
+                )
+                np.testing.assert_allclose(selected, expected)
+                self.assertNotEqual(ambiguity["alternative_branches"].iloc[0], "")
+
+    def test_explicit_m_rejects_invalid_branches_and_conflicting_prior(self):
+        candidates = synthetic_candidates()
+        for kwargs in [{"fixed_m": 2}, {"fixed_m": 0.5}, {"fixed_m": True},
+                       {"fixed_m": 0, "prior_aoa_deg": 30}]:
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                select_joint_source_aoa(candidates, SPOOF_SVIDS, **kwargs)
+
+    def test_best_m_export_keeps_joint_choice_and_missing_observations(self):
+        dp = pd.DataFrame({10: [78.0, 79.0], 16: [110.0, 111.0]})
+        eph = pd.DataFrame({10: [80.0, 81.0], 16: [60.0, 61.0]})
+        joint = pd.DataFrame({10: [143.0, np.nan]})
+        combined = build_best_m_all_satellite_aoa(dp, eph, (10,), joint_source_aoa=joint)
+        np.testing.assert_allclose(combined[10], joint[10], equal_nan=True)
+        np.testing.assert_allclose(combined[16], eph[16])
+        np.testing.assert_allclose(dp[10], [78.0, 79.0])
+
+    def test_per_epoch_reference_branch_follows_the_half_cycle_wrap(self):
+        # 30-1 PRN 2: cos(alpha_i) - cos(alpha_r) = -1.5, so the fractional DD flips between
+        # about +0.47 and -0.49. A constant m jumps a full cycle (~90 vs ~165 deg) at each flip.
+        alpha_r = 57.94
+        frac = pd.DataFrame({2: [0.47, -0.49, 0.47, -0.47, 0.30]})
+        eph = pd.DataFrame({2: [165.8] * 5}).rename_axis("epoch_index")
+        candidates = generate_aoa_candidates(frac, alpha_r)
+
+        constant = select_aoa_by_reference(candidates, eph, min_valid_fraction=0.6)
+        self.assertGreater(constant[2].max() - constant[2].min(), 60.0)
+
+        aoa, branch = select_aoa_by_reference_per_epoch(candidates, eph)
+        self.assertEqual(branch[2].tolist()[:4], [-2.0, -1.0, -2.0, -1.0])
+        self.assertTrue((aoa[2].iloc[:4] > 150.0).all())
+        # The nearest branch is cos = -1.17: outside [-1, 1], so NaN, not the valid branch at ~98 deg.
+        self.assertTrue(np.isnan(aoa[2].iloc[4]))
+        self.assertEqual(branch[2].iloc[4], -2.0)
+        summary = summarize_per_epoch_branches(branch, aoa)
+        self.assertEqual(summary.loc[0, ["branch", "branches", "branch_switches", "valid_epochs"]].tolist(),
+                         [-2, "-2;-1", 3, 4])
+
     def test_one_wavelength_branches_tie_in_direction_cosine_and_stay_unresolved(self):
         candidates = synthetic_candidates()
 

@@ -3,6 +3,7 @@ import unittest
 import pandas as pd
 
 from aoa_pipeline import (
+    _attach_navpvt_time_correction,
     _pivot_rawx,
     compute_ephemeris_predicted_pair_separation_cycles,
 )
@@ -57,6 +58,21 @@ class RawxCarrierPhaseQualityTests(unittest.TestCase):
         self.assertEqual(result.loc[0, 6], 10.0)
         self.assertTrue(pd.isna(result.loc[1, 6]))
         self.assertTrue(pd.isna(result.loc[2, 6]))
+
+    def test_time_correction_needs_a_navpvt_fix(self):
+        # sp-partial-28-09 cold start: NAV-PVT reports nano = 0 while fixType = 0.
+        rawx = pd.DataFrame(
+            {"rcvTow": [100.0, 101.0, 102.0], "cpMes": [10.0, 11.0, 12.0], "doMes": [1000.0] * 3}
+        )
+        navpvt = pd.DataFrame(
+            {"rcvTow": [100.0, 101.0, 102.0], "nano": [120000.0, 0.0, 119000.0], "fixType": [3, 0, 3]}
+        )
+
+        result = _attach_navpvt_time_correction(rawx, navpvt, 0, True)
+
+        self.assertAlmostEqual(result.loc[0, "carrier_phase_cycles"], 10.12)
+        self.assertTrue(pd.isna(result.loc[1, "carrier_phase_cycles"]))
+        self.assertAlmostEqual(result.loc[2, "carrier_phase_cycles"], 12.119)
 
 
 if __name__ == "__main__":

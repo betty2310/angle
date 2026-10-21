@@ -5,6 +5,78 @@ Written 2026-08-30 at the end of a session that processed the `dataset/sp-partia
 `aoa_pipeline.py`. Domain vocabulary is in `CONTEXT.md`; the paper digest is in
 `gnss_aoa_paper_methodology_context.md`.
 
+## 0a. Multi-window captures (2026-09-28, sp-partial-28-09)
+
+Long captures can hold several spoof-group windows (in sp-partial-28-09 `100356` both ZED-F9Ps
+were cold-started mid-capture). Changes:
+
+- `_attach_navpvt_time_correction` ignores NAV-PVT rows with `fixType` 0/1: without a fix the
+  receiver reports `nano = 0`, so Eq. 8 is wrong and those epochs are carrier-phase dropouts
+  (before: 11 epochs of 18–49° garbage AoA after the cold start).
+- `run_paper_scenario` with an automatic reference restricts the window to epochs where the
+  reference has NAV-SAT geometry, instead of raising "Reference NAV-SAT AoA is missing"
+  (the first-fix epoch still reports `elev=-91`).
+- `valid_epoch_segments` / `summarize_spoof_windows`; `CaptureProbe.spoof_windows` lists every window.
+- `aoa_experiment.run_experiment_windows` solves each window with ≥ `min_window_epochs` valid
+  epochs as its own experiment (`ExperimentConfig.start_epoch` + `max_epochs`) under
+  `output_dir/window_NN/experiment.json`, and writes `output_dir/windows.csv`. `AOA_Paper.ipynb` and
+  `run_aoa_figure_report.py` (one export per solved window) use it.
+- 28-08 v4/v5/v8/v9 reproduce the §0 table for their longest window; v9 also has a second 13-epoch window (90.4°).
+- sp-partial-28-09 `100356`: window 1 = 68.51° (96 ep), window 2 = 67.94° (133 ep), other branch
+  129.3° / 128.6°, `chosen_by` unresolved, ref PRN 16. PRN 10's ephemeris AoA (≈128.6°) coincides with the
+  mirror branch and PRN 32's (62.3°) is within 10° of the group, so only 23 and 28 are flagged on all branches.
+  `095826`: only PRN 23 has common valid phase (single-PRN group, 101.9°).
+- Split at the cold start (2026-09-29): `split_ubx_at_cold_start.py` cuts each log at its INF-NOTICE
+  "Stopping GNSS" (byte-exact, parts concatenate to the original) into `30-1/30-2`, `60-1/60-2`,
+  `90-1/90-2`, each with a `note.txt` spoof group. One window per part, 95–135 s. With prior = set-up
+  angle: 40.1/39.8° (other 103.6/103.4°), 68.5/67.9° (129.3/128.6°), 94.8/93.6° (23.7/18.8°), all
+  `chosen_by=prior`. Reports: `~/Desktop/AOA_Figures_sp-partial-28-09/<part>/window_01`.
+  `run_aoa_figure_report.py` now passes `EXPERIMENT_RUN` / `FILTER_FIGURES` (the export notebook's names).
+  `export_centered_wrapped_dd_comparison.py` draws the recording-1 vs recording-2 centered wrapped-DD figure
+  (the 90° v8/v9 template, generalized) per angle; replays go to `outputs/aoa_figure_exports/`, figures
+  to `~/Desktop/AOA_Figures_sp-partial-28-09/centered_wrapped_dd/{full_window,12_epochs}/`.
+- Manuscript time axis (2026-09-30): `export_paper_figures(display_duration_s=120)` / notebook `DISPLAY_DURATION_S`
+  / `--display-duration-s 120` shows the first 120 s on a fixed 0-120 s axis (shorter windows drawn in full,
+  rest empty; tables and group median over the displayed epochs; full window kept in `data/analysis_window/`).
+  Desktop reports and `centered_wrapped_dd/120s/` use it.
+  `extend_authentic` (notebook `EXTEND_AUTHENTIC`, `--extend-authentic`): a window shorter than 120 s also draws the
+  authentic PRNs after the spoof window (whole-capture re-run, same reference/anchor/per-PRN m, checked against the
+  window); spoof PRNs end with the window; drawn only, not in tables. 60-1 +25 epochs, 30-2 +5.
+  Fixed 2026-09-30: constant-m authentic AoA jumped ~60-75° when a PRN's fractional DD crossed +-0.5 (30-1 PRN 2,
+  30-2 PRN 4, 60-1 PRN 3 at t=100 s, 60-2 PRNs 3/4). `select_aoa_by_reference_per_epoch` now picks each authentic
+  PRN's m per epoch (closest direction cosine to the ephemeris AoA; NaN if that branch is outside [-1, 1]) and feeds
+  the best-m figures, `authentic_after_window` and `paper_all_satellite_ephemeris_aligned_branch_by_epoch.csv`.
+  It is the default for authentic SVs in the paper flow: `ephemeris_aligned_dd_method_aoa_deg` is the per-epoch AoA,
+  `ephemeris_aligned_branch` is its per-SVID summary (`branch` = most common m, `branches`, `branch_switches`,
+  `valid_epochs`), and the constant-m result survives only as the `ephemeris_aligned_constant_m` row of the
+  equivalence summary. The pairwise classifier's `branch_selection_method="best_m"` still uses constant m.
+  Spoof PRNs still use the joint-source branch. All six 28-09 parts re-run 2026-09-30 (120s / full_window /
+  12_epochs exports + Desktop publish): spoof group medians unchanged (40.12, 39.85, 68.51, 67.95, 94.85, 93.77);
+  the jumps are gone (30-1 PRN 2 is now 155-178° with 27 NaN epochs where cos < -1).
+  Wrap policy (user, 2026-09-30): `export_paper_figures(exclude_wrapping_authentic=True)` drops every authentic PRN
+  whose fractional DD crosses +-0.5 on the drawn epochs (window + after-window extension) from all figures and both
+  agreement tables (manifest `wrap_excluded_authentic_svids`); spoof PRNs stay and Figure 1 / the centered
+  comparison break their lines at the wrap (`break_at_wraps`, `wrapping_prns`). Colors use manifest `style_prns`
+  (assigned before exclusion). 120s wrap-excluded: 30-1 [2,4,27], 30-2 [4], 60-1 [3,31], 60-2 [3,4], 90-1 [4],
+  90-2 [4]; 12_epochs excludes fewer because it draws fewer epochs.
+  Centered comparison alignment (user, 2026-09-30): `align_recordings` keeps only PRNs drawn in both recordings,
+  same order, one shared style table (same color/marker per PRN in (a) and (b)); raises if the references differ.
+  JSON: `common_prns`, per-recording `dropped_prns_not_in_other_recording`. 120s: 30 drops 27 (rec2), 60 drops
+  4 (rec1) and 2 (rec2), 90 drops 3 (rec2).
+  Desktop layout (user, 2026-09-30): `publish_manuscript_figures.py <export root>/120s --output-root ~/Desktop/...`
+  writes one flat folder per run with only figures + the unfiltered table, named `<run>_fraction_dd`, `_alpha_ephemeris`,
+  `_alpha_proposed_best_m`, `_alpha_side_by_side`, `_authentic_agreement` (run `30-1` -> prefix `30_1`).
+  Table rule (user, 2026-09-30): every clean PRN drawn in a figure must have a table row. The 7 deg filtered table
+  broke this in all 18 28-09 exports (it dropped PRNs the figures still drew), so only the unfiltered table is
+  published and `check_table_covers_figures` raises on any gap; `AOA_Export_Figures.ipynb` now defaults
+  `AUTHENTIC_MAX_ERROR_DEG = None`.
+  Reports/manifests/data stay in `outputs/aoa_figure_exports/sp-partial-28-09/120s/<run>/`.
+- NAV-SAT svUsed check (2026-09-29): `navsat_sv_status_by_second` (per GPS second, drops
+  pre-time cold-start rows, keeps dropouts), `summarize_sv_used_by_window`, `plot_sv_used_by_tow`;
+  `AOA_Paper.ipynb` §4 shows them and saves `sv_used_by_window.csv`. Tests in `test_aoa_sv_used.py`.
+  sp-partial-28-09 `90/`: spoof PRNs are in both receivers' fixes for 93–98 % (W1) / 91 % (W2) of the
+  window; the unused seconds are right after (re)acquisition and at the cold start.
+
 ## 0. Status after the refactor session (2026-08-30)
 
 Everything below §0 is the state *before* the refactor and is kept as the record of why.

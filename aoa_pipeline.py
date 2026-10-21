@@ -178,6 +178,10 @@ class PaperScenarioResult:
     spoof_branch_candidates: pd.DataFrame = field(default_factory=pd.DataFrame)
     spoof_branch_detection: pd.DataFrame = field(default_factory=pd.DataFrame)
     prior_aoa_deg: float | None = None
+    window_quality: pd.DataFrame = field(default_factory=pd.DataFrame)
+    # Authentic SVs: per-epoch branch m closest to the ephemeris-based AoA (the "best m" plot);
+    # ``ephemeris_aligned_branch`` summarizes it per SVID.
+    ephemeris_aligned_branch_by_epoch: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def _make_ubx_reader(stream) -> UBXReader:
@@ -506,6 +510,11 @@ def _attach_navpvt_time_correction(
         return data
 
     data["_navpvt_sync_tow"] = data["rcvTow"].round(tow_round_decimals)
+    if "fixType" in navpvt.columns:
+        # Without a GNSS fix (0 = none, 1 = dead reckoning only) the receiver reports
+        # nano = 0 instead of its clock offset, so Eq. 8 cannot be applied. Such epochs
+        # (e.g. a cold start) become carrier-phase dropouts, not measurements.
+        navpvt = navpvt.loc[~navpvt["fixType"].isin((0, 1))]
     nano = navpvt[["rcvTow", "nano"]].dropna(subset=["rcvTow", "nano"]).copy()
     nano["_navpvt_sync_tow"] = nano["rcvTow"].round(tow_round_decimals)
     nano = (
@@ -722,9 +731,10 @@ def compute_single_difference(
     """Compute receiver single differences in carrier cycles.
 
     ``order="rx1-rx2"`` (default) uses ``RX1 - RX2``; ``order="rx2-rx1"`` uses ``RX2 - RX1``,
-    which flips the baseline polarity, i.e. negates every downstream double difference and
-    DD-method AoA. The order must match the baseline direction assumed by the ephemeris AoA
-    (the azimuth bias): the two orders yield supplementary AoA (``alpha`` vs ``180 - alpha``).
+    which negates the single and double differences. Reversing the order alone does not
+    make the solved AoA supplementary: the reference geometry and integer branch must
+    also be reversed consistently. With that complete baseline reversal, the same
+    source is described by ``180 - alpha`` instead of ``alpha``.
     """
     if order not in ("rx1-rx2", "rx2-rx1"):
         raise ValueError(f"order must be 'rx1-rx2' or 'rx2-rx1', got {order!r}")
@@ -1043,7 +1053,11 @@ def select_aoa_by_reference(
     return_branches: bool = False,
     min_valid_fraction: float = 0.8,
 ) -> pd.DataFrame | tuple[pd.DataFrame, pd.Series]:
-    """Resolve one branch per satellite by matching a reference AoA, then return per-epoch AoA.
+    """Resolve one constant branch per satellite by matching a reference AoA.
+
+    Legacy/comparison selection: the paper flow uses :func:`select_aoa_by_reference_per_epoch`
+    for authentic SVs, because a constant ``m`` breaks when the fractional DD crosses +-0.5.
+    Still used by the pairwise classifier's ``branch_selection_method="best_m"``.
 
     For each satellite, pick one branch ``m`` that is valid across most of the satellite's
     valid epochs and has the smallest median error to ``reference_aoa`` (e.g.
@@ -1114,6 +1128,53 @@ def select_aoa_by_reference(
     if return_branches:
         return selected, pd.Series(chosen, name="chosen_branch").sort_index()
     return selected
+
+
+def select_aoa_by_reference_per_epoch(
+    candidates: pd.DataFrame,
+    reference_aoa: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Pick the branch ``m`` at every epoch whose direction cosine is closest to the reference.
+
+    A constant ``m`` (:func:`select_aoa_by_reference`) is only valid while the fractional DD
+    stays on one side of the +-0.5 cycle wrap: when a satellite's ``cos(alpha_i) - cos(alpha_r)``
+    is near a half-integer, noise flips the rounded integer and the same ``m`` lands one full
+    cycle away (e.g. 30-1 PRN 2 jumping between 90 and 165 deg). Matching
+    ``cos(reference_aoa)`` per epoch follows the wrap. The nearest branch is taken over all
+    branches, valid or not; when it falls outside [-1, 1] the epoch stays NaN rather than
+    switching to a valid branch one cycle away.
+
+    For authentic satellites only: like :func:`select_aoa_by_reference`, this ties the DD-method
+    AoA to the ephemeris under test, so it is a geometry-conditioned comparison, not a spoof test.
+    Returns ``(aoa_deg, branch)``, both epoch x SVID.
+    """
+    frame = candidates.dropna(subset=["fractional_dd_cycles", "candidate_cos_alpha"]).copy()
+    frame["svid"] = frame["svid"].astype(int)
+    frame["branch"] = frame["branch"].astype(int)
+    all_epochs = sorted(int(epoch) for epoch in candidates["epoch_index"].unique())
+    reference = reference_aoa.copy()
+    reference.columns = [int(column) for column in reference.columns]
+    reference_long = (
+        reference.rename_axis("epoch_index").reset_index()
+        .melt(id_vars="epoch_index", var_name="svid", value_name="reference_aoa_deg")
+        .dropna(subset=["reference_aoa_deg"])
+    )
+    reference_long["svid"] = reference_long["svid"].astype(int)
+    frame = frame.merge(reference_long, on=["epoch_index", "svid"], how="inner")
+    svids = sorted(int(svid) for svid in frame["svid"].unique())
+    empty = pd.DataFrame(index=pd.Index(all_epochs, name="epoch_index"), columns=svids, dtype=float)
+    if frame.empty:
+        return empty, empty.copy()
+    frame["cos_error"] = (
+        frame["candidate_cos_alpha"] - np.cos(np.deg2rad(frame["reference_aoa_deg"]))
+    ).abs()
+    best = frame.loc[frame.groupby(["epoch_index", "svid"])["cos_error"].idxmin()]
+    aoa = best.pivot(index="epoch_index", columns="svid", values="candidate_aoa_deg")
+    branch = best.pivot(index="epoch_index", columns="svid", values="branch")
+    return (
+        aoa.reindex(index=empty.index, columns=svids).astype(float),
+        branch.reindex(index=empty.index, columns=svids).astype(float),
+    )
 
 
 def valid_m_candidates(candidates: pd.DataFrame) -> pd.DataFrame:
@@ -1213,6 +1274,35 @@ def _branch_series_to_frame(branches: pd.Series) -> pd.DataFrame:
     return frame.sort_values("svid").reset_index(drop=True)
 
 
+def summarize_per_epoch_branches(
+    branch_by_epoch: pd.DataFrame, aoa: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """Per-SVID summary of per-epoch branches: most common ``m``, every ``m`` used, switches.
+
+    ``branch`` is the most common ``m`` over epochs with a valid AoA (all epochs when ``aoa`` is
+    omitted); ``branches`` lists every ``m`` used there; ``branch_switches`` counts changes
+    between consecutive valid epochs (a switch across the +-0.5 cycle wrap is expected).
+    """
+    rows = []
+    for column in branch_by_epoch.columns:
+        branch = branch_by_epoch[column]
+        if aoa is not None:
+            branch = branch.where(aoa[column].reindex(branch.index).notna()) if column in aoa else branch.iloc[:0]
+        branch = branch.dropna().astype(int)
+        if branch.empty:
+            continue
+        rows.append({
+            "svid": int(column),
+            "branch": int(branch.mode().iloc[0]),
+            "branches": ";".join(str(value) for value in sorted(branch.unique())),
+            "branch_switches": int(branch.diff().fillna(0).ne(0).sum()),
+            "valid_epochs": int(len(branch)),
+        })
+    if not rows:
+        return pd.DataFrame(columns=["svid", "branch", "branches", "branch_switches", "valid_epochs"])
+    return pd.DataFrame(rows).sort_values("svid").reset_index(drop=True)
+
+
 def summarize_aoa_method_equivalence(
     *,
     dp_aoa: pd.DataFrame,
@@ -1220,6 +1310,7 @@ def summarize_aoa_method_equivalence(
     ephemeris_aligned_aoa: pd.DataFrame,
     ephemeris_aoa: pd.DataFrame,
     ephemeris_aligned_branch: pd.Series,
+    per_epoch_aligned_aoa: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Compare DD-method AoA variants against ephemeris-based AoA per SVID."""
 
@@ -1279,6 +1370,8 @@ def summarize_aoa_method_equivalence(
             ephemeris_aligned_branch,
         )
     )
+    if per_epoch_aligned_aoa is not None:
+        rows.extend(summarize_one("ephemeris_aligned_per_epoch_m", per_epoch_aligned_aoa))
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows).sort_values(["svid", "method"]).reset_index(drop=True)
@@ -1288,16 +1381,20 @@ def build_best_m_all_satellite_aoa(
     dp_aoa: pd.DataFrame,
     ephemeris_aligned_aoa: pd.DataFrame,
     spoof_svids: Sequence[int] = (),
+    *,
+    joint_source_aoa: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Use the best (ephemeris-aligned) branch ``m`` for authentic SVs, DP branch for spoofed SVs.
 
     The time-smoothness DP (:func:`select_aoa_dp`) sometimes locks onto the wrong integer branch
     ``m`` for an authentic satellite, which inflates its DD-vs-ephemeris error even though the
     signal is genuine (e.g. SV24/SV25 in the partial-spoof set). For authentic SVs this swaps in
-    the ephemeris-aligned constant-m branch from :func:`select_aoa_by_reference` -- the "best m"
-    visible in the brute-force candidate plot -- which resolves the branch from geometry.
+    the ephemeris-aligned AoA -- :func:`run_paper_scenario` passes the per-epoch selection
+    (:func:`select_aoa_by_reference_per_epoch`), which resolves the branch from geometry and
+    follows the +-0.5 cycle wrap.
 
-    Spoofed SVs deliberately keep the DP branch: ephemeris-aligning a spoofed PRN biases it
+    Spoofed SVs use the joint-source selection when supplied, otherwise the DP branch:
+    ephemeris-aligning a spoofed PRN biases it
     toward the very ephemeris under test and scatters it off the common-source collapse, so the
     spoof signature is preserved by leaving those columns untouched. Authentic SVs without an
     ephemeris reference (no NAV-SAT AoA) also fall back to the DP branch.
@@ -1309,6 +1406,9 @@ def build_best_m_all_satellite_aoa(
     combined = dp_aoa.copy()
     for column in combined.columns:
         svid = int(column)
+        if svid in spoof and joint_source_aoa is not None and svid in joint_source_aoa:
+            combined[column] = joint_source_aoa[svid].reindex(combined.index)
+            continue
         if svid in spoof or svid not in ephemeris_by_svid:
             continue
         combined[column] = ephemeris_aligned_aoa[ephemeris_by_svid[svid]].reindex(
@@ -1549,22 +1649,28 @@ def compute_reference_alpha_by_epoch(
     return matched.drop(columns=["_navsat_sync_tow"])
 
 
-def longest_valid_epoch_segment(valid_mask: pd.Series) -> list[int]:
-    """Return the longest contiguous epoch segment where a boolean mask is true."""
+def valid_epoch_segments(
+    valid_mask: pd.Series, *, max_gap_epochs: int = 0
+) -> list[list[int]]:
+    """Return every window in time order, retaining at most ``max_gap_epochs`` per gap.
+
+    Both endpoints of each window must be valid. Internal invalid epochs remain in
+    the returned window, without changing the mask or filling any measurements.
+    """
+    if isinstance(max_gap_epochs, bool) or not isinstance(max_gap_epochs, (int, np.integer)) or max_gap_epochs < 0:
+        raise ValueError("max_gap_epochs must be a non-negative integer.")
+    if not valid_mask.index.is_unique or not valid_mask.index.is_monotonic_increasing:
+        raise ValueError("Epoch indices must be unique and increasing.")
     segments: list[list[int]] = []
     current: list[int] = []
     previous: int | None = None
 
-    for epoch, valid in valid_mask.items():
+    for epoch, valid in valid_mask.fillna(False).items():
         epoch = int(epoch)
         if not bool(valid):
-            if current:
-                segments.append(current)
-                current = []
-            previous = None
             continue
 
-        if previous is None or epoch == previous + 1:
+        if previous is None or epoch - previous - 1 <= max_gap_epochs:
             current.append(epoch)
         else:
             if current:
@@ -1574,7 +1680,35 @@ def longest_valid_epoch_segment(valid_mask: pd.Series) -> list[int]:
 
     if current:
         segments.append(current)
-    return max(segments, key=len) if segments else []
+    return [
+        [int(epoch) for epoch in valid_mask.index if segment[0] <= epoch <= segment[-1]]
+        for segment in segments
+    ]
+
+
+def longest_valid_epoch_segment(
+    valid_mask: pd.Series, *, max_gap_epochs: int = 0
+) -> list[int]:
+    """Return the longest window of :func:`valid_epoch_segments`.
+
+    Rank by span, then valid-epoch count, then earliest start. Zero preserves
+    strict selection.
+    """
+    segments = valid_epoch_segments(valid_mask, max_gap_epochs=max_gap_epochs)
+    if not segments:
+        return []
+    return max(
+        segments,
+        key=lambda epochs: (epochs[-1] - epochs[0], int(valid_mask.reindex(epochs).fillna(False).sum())),
+    )
+
+
+def _minimum_valid_spoof_prns(minimum: int | None, group_size: int) -> int:
+    if minimum is None:
+        return group_size
+    if isinstance(minimum, bool) or not isinstance(minimum, (int, np.integer)) or not 1 <= minimum <= group_size:
+        raise ValueError(f"min_valid_spoof_prns must be between 1 and {group_size}, or None for all PRNs.")
+    return int(minimum)
 
 
 def sort_svid_columns(
@@ -1751,6 +1885,80 @@ def summarize_sv_used(
     return pd.DataFrame(rows)
 
 
+SV_STATUS_NOT_TRACKED, SV_STATUS_TRACKED, SV_STATUS_USED = -1.0, 0.0, 1.0
+
+
+def navsat_sv_status_by_second(
+    navsat: pd.DataFrame, *, max_forward_jump_s: float = 3600.0
+) -> pd.DataFrame:
+    """NAV-SAT status of every PRN per whole GPS second.
+
+    Values: -1 not tracked (not listed, or C/N0 = 0), 0 tracked but not used in the
+    navigation solution, 1 used (``svUsed``). Seconds without any NAV-SAT message stay
+    NaN, so dropouts remain visible. Rows logged before the receiver knew GPS time
+    (after a cold start ``rcvTow`` restarts from a few seconds) are dropped: in file
+    order, rows below the running maximum TOW, and rows before a forward TOW jump of
+    more than ``max_forward_jump_s``.
+    """
+    if navsat.empty:
+        return pd.DataFrame()
+    data = navsat.dropna(subset=["rcvTow", "svid"]).copy()
+    data = data.loc[data["rcvTow"].ge(data["rcvTow"].cummax())]
+    jumps = np.flatnonzero(data["rcvTow"].diff().gt(max_forward_jump_s).to_numpy())
+    if jumps.size:
+        data = data.iloc[jumps[-1]:]
+    if data.empty:
+        return pd.DataFrame()
+    data["tow_s"] = data["rcvTow"].round().astype(int)
+    data["svid"] = data["svid"].astype(int)
+    used = pd.to_numeric(data["svUsed"], errors="coerce").gt(0)
+    tracked = pd.to_numeric(data["cno"], errors="coerce").gt(0)
+    data["status"] = np.select(
+        [used, tracked], [SV_STATUS_USED, SV_STATUS_TRACKED], SV_STATUS_NOT_TRACKED
+    )
+    status = data.pivot_table(index="tow_s", columns="svid", values="status", aggfunc="max")
+    status = status.fillna(SV_STATUS_NOT_TRACKED)
+    status = status.loc[:, status.gt(SV_STATUS_NOT_TRACKED).any()]
+    seconds = pd.RangeIndex(int(status.index.min()), int(status.index.max()) + 1, name="tow_s")
+    return status.reindex(seconds).sort_index(axis=1)
+
+
+def summarize_sv_used_by_window(
+    status_by_receiver: Mapping[str, pd.DataFrame],
+    windows: pd.DataFrame,
+    spoof_svids: Sequence[int],
+) -> pd.DataFrame:
+    """Per window, receiver and PRN: seconds tracked and used in the navigation solution.
+
+    ``windows`` needs ``window``, ``start_tow`` and ``end_tow``. Spoof PRNs are always
+    listed; authentic PRNs only when tracked inside the window. ``pct_used`` is over
+    the window's seconds, so NAV-SAT dropouts count as not used.
+    """
+    spoof = _normalise_svids(spoof_svids) or ()
+    rows: list[dict[str, object]] = []
+    for window in windows.itertuples(index=False):
+        first, last = round(float(window.start_tow)), round(float(window.end_tow))
+        for receiver, status in status_by_receiver.items():
+            span = status.loc[(status.index >= first) & (status.index <= last)]
+            tracked_svids = [int(svid) for svid in span.columns if span[svid].ge(0).any()]
+            for svid in list(spoof) + sorted(set(tracked_svids) - set(spoof)):
+                series = span[svid] if svid in span.columns else pd.Series(dtype=float)
+                seconds = last - first + 1
+                used = int(series.eq(SV_STATUS_USED).sum())
+                rows.append({
+                    "window": int(window.window),
+                    "receiver": receiver,
+                    "svid": svid,
+                    "role": "spoof" if svid in spoof else "authentic",
+                    "window_seconds": seconds,
+                    "navsat_seconds": int(span.notna().any(axis=1).sum()),
+                    "tracked_seconds": int(series.ge(SV_STATUS_TRACKED).sum()),
+                    "used_seconds": used,
+                    "pct_used": 100.0 * used / seconds,
+                })
+    return pd.DataFrame(rows)
+
+
 def _branch_step_direction_cosine(candidates: pd.DataFrame) -> float:
     """Direction-cosine step between adjacent Eq. 21 branches, i.e. ``1 / (D / lambda)``."""
     data = candidates.dropna(subset=["candidate_cos_alpha"])
@@ -1773,6 +1981,7 @@ def select_joint_source_aoa(
     *,
     metric: str = "direction_cosine",
     prior_aoa_deg: float | None = None,
+    fixed_m: int | None = None,
     prior_weight: float = 1.0,
     tie_tolerance: float | None = None,
     spread_weight: float = 4.0,
@@ -1796,6 +2005,9 @@ def select_joint_source_aoa(
     step in direction cosine, at least 0.01). The tie is broken in this order and recorded
     in the ambiguity table as ``chosen_by``:
 
+    - ``"explicit_m"``: a declared ``fixed_m`` selects a fully valid uniform shift of the
+      joint path with that branch at every epoch and SVID. It does not resolve the data's
+      ambiguity. Invalid fixed branches raise instead of clipping or dropping observations.
     - ``"data"``: no tied alternative, the DP path stands;
     - ``"prior"``: ``prior_aoa_deg`` picks, among the DP path and the tied alternatives, the
       combination minimising ``mean excess + prior_weight * |cos(median AoA) - cos(prior)|``;
@@ -1827,6 +2039,11 @@ def select_joint_source_aoa(
         raise ValueError("prior_weight must be non-negative.")
     if tie_tolerance is not None and tie_tolerance < 0:
         raise ValueError("tie_tolerance must be non-negative.")
+    if fixed_m is not None:
+        if isinstance(fixed_m, bool) or not isinstance(fixed_m, (int, np.integer)):
+            raise ValueError("fixed_m must be an integer or None.")
+        if prior_aoa_deg is not None:
+            raise ValueError("Declare either fixed_m or prior_aoa_deg, not both.")
 
     branch_values = sorted(int(branch) for branch in candidates["branch"].unique())
     if len(branch_values) ** len(selected_svids) > max_states_per_epoch:
@@ -1896,6 +2113,7 @@ def select_joint_source_aoa(
         "tie_tolerance",
         "metric",
         "prior_aoa_deg",
+        "fixed_m",
     ]
     if not states_by_epoch:
         ambiguity = pd.DataFrame(columns=ambiguity_columns)
@@ -1997,7 +2215,20 @@ def select_joint_source_aoa(
     ambiguous = bool(tied)
     options = [0, *tied]
 
-    if not ambiguous:
+    if fixed_m is not None:
+        matching = [
+            shift for shift, evaluation in evaluations.items()
+            if evaluation["fully_valid"]
+            and np.all(evaluation["branches"] == fixed_m)
+        ]
+        if not matching:
+            raise ValueError(
+                f"fixed_m={fixed_m} is not a fully valid uniform branch of the joint-source "
+                "path at every epoch and satellite. Inspect the branch candidates."
+            )
+        selected_shift = matching[0]
+        chosen_by = "explicit_m"
+    elif not ambiguous:
         selected_shift = 0
         chosen_by = "data"
     elif prior_aoa_deg is not None:
@@ -2095,6 +2326,7 @@ def select_joint_source_aoa(
             "tie_tolerance": tolerance,
             "metric": metric,
             "prior_aoa_deg": np.nan if prior_aoa_deg is None else float(prior_aoa_deg),
+            "fixed_m": np.nan if fixed_m is None else int(fixed_m),
         },
         columns=ambiguity_columns,
     )
@@ -2105,6 +2337,61 @@ def select_joint_source_aoa(
     if return_ambiguity:
         outputs.append(ambiguity)
     return tuple(outputs) if len(outputs) > 1 else selected
+
+
+def select_joint_source_aoa_segments(
+    candidates: pd.DataFrame,
+    svids: Sequence[int],
+    *,
+    min_valid_spoof_prns: int | None = None,
+    **selection_options,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Select available PRNs jointly, restarting at gaps or membership changes.
+
+    Each block calls the existing complete-group selector independently. Missing
+    PRNs and epochs stay NaN; no smoothness constraint crosses a reacquisition.
+    The ambiguity table records each block's PRNs and branch decision.
+    """
+    svids = _normalise_svids(svids) or ()
+    if not svids:
+        raise ValueError("At least one SVID is required.")
+    minimum = _minimum_valid_spoof_prns(min_valid_spoof_prns, len(svids))
+    epochs = sorted(int(epoch) for epoch in candidates["epoch_index"].unique())
+    selected = pd.DataFrame(index=epochs, columns=svids, dtype=float)
+    branches = selected.copy()
+    selected.index.name = branches.index.name = "epoch_index"
+    valid = candidates.loc[
+        candidates["svid"].isin(svids) & candidates["candidate_aoa_deg"].notna()
+    ]
+    available = valid.groupby("epoch_index")["svid"].agg(
+        lambda values: tuple(svid for svid in svids if svid in set(values))
+    )
+    blocks: list[tuple[tuple[int, ...], list[int]]] = []
+    previous: int | None = None
+    for epoch, members in available.items():
+        epoch = int(epoch)
+        if len(members) < minimum:
+            previous = None
+            continue
+        if blocks and previous is not None and epoch == previous + 1 and members == blocks[-1][0]:
+            blocks[-1][1].append(epoch)
+        else:
+            blocks.append((members, [epoch]))
+        previous = epoch
+    ambiguity_parts = []
+    for segment_id, (members, block_epochs) in enumerate(blocks):
+        block = candidates.loc[candidates["epoch_index"].isin(block_epochs)]
+        aoa, branch, ambiguity = select_joint_source_aoa(
+            block, members, return_branches=True, return_ambiguity=True,
+            **selection_options,
+        )
+        selected.loc[aoa.index, list(members)] = aoa
+        branches.loc[branch.index, list(members)] = branch
+        ambiguity["segment_id"] = segment_id
+        ambiguity["active_svids"] = ",".join(map(str, members))
+        ambiguity_parts.append(ambiguity)
+    ambiguity = pd.concat(ambiguity_parts, ignore_index=True) if ambiguity_parts else pd.DataFrame()
+    return selected, branches, ambiguity
 
 
 def summarize_branch_candidates(
@@ -3390,6 +3677,44 @@ def _describe_segments(segments: Sequence[tuple[int, int]], tow: pd.Series | Non
     return "; ".join(parts)
 
 
+SPOOF_WINDOW_COLUMNS = [
+    "window", "start_epoch", "end_epoch", "epochs", "valid_epochs",
+    "start_tow", "end_tow", "solvable",
+]
+
+
+def summarize_spoof_windows(
+    valid_mask: pd.Series,
+    tow: pd.Series,
+    *,
+    max_gap_epochs: int = 0,
+    min_window_epochs: int = 2,
+) -> pd.DataFrame:
+    """List every spoof-group window of a capture in time order.
+
+    ``valid_mask`` marks synchronized epochs that meet the spoof-PRN count policy;
+    windows split at gaps longer than ``max_gap_epochs``. A window is ``solvable``
+    when it holds at least ``min_window_epochs`` valid epochs. Epoch numbers are
+    synchronized-epoch positions, i.e. ``DatasetConfig.start_index`` values.
+    """
+    rows = []
+    for number, epochs in enumerate(
+        valid_epoch_segments(valid_mask, max_gap_epochs=max_gap_epochs), start=1
+    ):
+        valid = int(valid_mask.reindex(epochs).fillna(False).sum())
+        rows.append({
+            "window": number,
+            "start_epoch": epochs[0],
+            "end_epoch": epochs[-1],
+            "epochs": len(epochs),
+            "valid_epochs": valid,
+            "start_tow": float(tow.get(epochs[0], np.nan)),
+            "end_tow": float(tow.get(epochs[-1], np.nan)),
+            "solvable": valid >= min_window_epochs,
+        })
+    return pd.DataFrame(rows, columns=SPOOF_WINDOW_COLUMNS)
+
+
 @dataclass
 class CaptureProbe:
     """Data check of a two-receiver capture before the DD-method AoA flow."""
@@ -3409,6 +3734,7 @@ class CaptureProbe:
     longest_all_spoof_valid_run: int
     problems: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    spoof_windows: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     @property
     def ok(self) -> bool:
@@ -3434,6 +3760,8 @@ def probe_capture(
     navpvt_tow_decimals: int = 0,
     thin_window_epochs: int = 5,
     min_window_epochs: int = 2,
+    min_valid_spoof_prns: int | None = None,
+    max_gap_epochs: int = 0,
 ) -> CaptureProbe:
     """Check that a two-receiver capture can feed the DD-method AoA flow.
 
@@ -3634,16 +3962,26 @@ def probe_capture(
         all_valid = false_column
     all_valid_count = int(all_valid.sum())
     longest_run = len(longest_valid_epoch_segment(all_valid))
-    if usable_spoof and longest_run < min_window_epochs:
+    policy_mask = all_valid
+    minimum = len(usable_spoof)
+    if usable_spoof:
+        minimum = _minimum_valid_spoof_prns(min_valid_spoof_prns, len(usable_spoof))
+        policy_mask = common_valid.reindex(columns=list(usable_spoof)).sum(axis=1).ge(minimum)
+    policy_window = longest_valid_epoch_segment(policy_mask, max_gap_epochs=max_gap_epochs)
+    valid_window_count = int(policy_mask.reindex(policy_window).sum())
+    spoof_windows = summarize_spoof_windows(
+        policy_mask, tow, max_gap_epochs=max_gap_epochs, min_window_epochs=min_window_epochs,
+    )
+    if usable_spoof and valid_window_count < min_window_epochs:
         problems.append(
-            f"only {longest_run} continuous epoch(s) have every usable spoof PRN "
-            f"{list(usable_spoof)} valid in both receivers at the same time; the joint-source "
+            f"only {valid_window_count} valid epoch(s) have at least {minimum} usable spoof PRNs "
+            f"in one window with gaps <= {max_gap_epochs} epoch(s); the joint-source "
             f"selection needs at least {min_window_epochs}. Check lock time and halfCyc in "
             "receiver_svid_summary."
         )
-    elif usable_spoof and longest_run < thin_window_epochs:
+    elif usable_spoof and valid_window_count < thin_window_epochs:
         warnings.append(
-            f"only {longest_run} continuous epoch(s) have every usable spoof PRN valid in "
+            f"only {valid_window_count} epoch(s) meet the spoof-PRN count policy in "
             "both receivers; the AoA window will be thin."
         )
 
@@ -3663,6 +4001,7 @@ def probe_capture(
         longest_all_spoof_valid_run=longest_run,
         problems=problems,
         warnings=warnings,
+        spoof_windows=spoof_windows,
     )
 
 
@@ -4405,7 +4744,7 @@ def plot_sv_used_timeline(
         ax.set_xlabel("NAV-SAT epoch index")
         ax.grid(False)
 
-    fig.suptitle(title, y=0.99)
+    fig.suptitle(title)
     if image is not None:
         cbar = fig.colorbar(
             image, ax=axes.tolist(), ticks=[-1, 0, 1], fraction=0.025, pad=0.02
@@ -4414,10 +4753,120 @@ def plot_sv_used_timeline(
     return fig
 
 
+def plot_sv_used_by_tow(
+    status_by_receiver: Mapping[str, pd.DataFrame],
+    *,
+    highlight_svids: Sequence[int] = (),
+    windows: pd.DataFrame | None = None,
+    min_tracked_seconds: int = 10,
+    title: str = "PRNs used in the receiver navigation solution (NAV-SAT svUsed)",
+):
+    """Per-receiver svUsed timelines on a GPS-TOW axis plus the used-PRN count.
+
+    ``status_by_receiver`` comes from ``navsat_sv_status_by_second``. Highlighted
+    (spoof) PRNs are drawn first, above a red line. ``windows`` (``window``,
+    ``start_tow``, ``end_tow``) marks the analysis windows. Other PRNs are shown when
+    used at least once or tracked for ``min_tracked_seconds`` in some receiver; the
+    used-PRN count always includes every PRN. NAV-SAT dropouts stay blank.
+    """
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+    from matplotlib.patches import Patch
+
+    plt = _import_pyplot()
+    highlight = list(_normalise_svids(highlight_svids) or ())
+    others = sorted(
+        {int(svid) for status in status_by_receiver.values() for svid in status.columns}
+        - set(highlight)
+    )
+    shown = sorted(
+        {
+            int(svid)
+            for status in status_by_receiver.values()
+            for svid in status.columns
+            if int(svid) in others
+            and (status[svid].eq(SV_STATUS_USED).any()
+                 or status[svid].ge(SV_STATUS_TRACKED).sum() >= min_tracked_seconds)
+        }
+    )
+    svids = highlight + shown
+    receivers = list(status_by_receiver)
+    fig, axes = plt.subplots(
+        len(receivers) + 1, 1, sharex=True, constrained_layout=True,
+        figsize=(12, 2.8 + 0.17 * len(svids) * len(receivers) + 2.0),
+        gridspec_kw={"height_ratios": [max(len(svids), 1)] * len(receivers) + [10]},
+    )
+    colors = ["#e6e6e6", "#f2b447", "#277f6a"]
+    cmap = ListedColormap(colors)
+    cmap.set_bad("white")
+    norm = BoundaryNorm([-1.5, -0.5, 0.5, 1.5], cmap.N)
+
+    count_ax = axes[-1]
+    for index, (ax, receiver) in enumerate(zip(axes, receivers)):
+        status = status_by_receiver[receiver]
+        ax.set_ylabel(f"{receiver}\nPRN")
+        if status.empty:
+            ax.text(0.5, 0.5, "No NAV-SAT svUsed data", ha="center", va="center", transform=ax.transAxes)
+            continue
+        present = status.notna().any(axis=1)
+        full = status.reindex(columns=highlight + others)
+        full = full.where(~present, full.fillna(SV_STATUS_NOT_TRACKED))
+        matrix = full[svids]
+        tow = matrix.index.to_numpy(dtype=float)
+        ax.imshow(
+            np.ma.masked_invalid(matrix.T.to_numpy(dtype=float)),
+            aspect="auto", interpolation="nearest", cmap=cmap, norm=norm,
+            extent=(tow[0] - 0.5, tow[-1] + 0.5, len(svids) - 0.5, -0.5),
+        )
+        ax.set_yticks(range(len(svids)))
+        ax.set_yticklabels([str(svid) for svid in svids], fontsize=7)
+        for tick, svid in zip(ax.get_yticklabels(), svids):
+            if svid in highlight:
+                tick.set_color("crimson")
+                tick.set_fontweight("bold")
+        if highlight and shown:
+            ax.axhline(len(highlight) - 0.5, color="crimson", linewidth=0.8)
+
+        used = full.eq(SV_STATUS_USED)
+        color = f"C{index}"
+        for group, style, label in ((highlight, "-", "spoof"), (others, "--", "authentic")):
+            if group:
+                count = used[group].sum(axis=1).where(present)
+                count_ax.step(tow, count, where="mid", color=color, linestyle=style,
+                              label=f"{receiver} {label}")
+
+    if highlight:
+        count_ax.axhline(len(highlight), color="crimson", linestyle=":", linewidth=0.8)
+    count_ax.set_ylabel("PRNs used")
+    count_ax.set_ylim(bottom=0)
+    count_ax.legend(loc="lower right", fontsize=8, ncol=len(receivers))
+    count_ax.set_xlabel("GPS TOW (s)")
+    count_ax.ticklabel_format(axis="x", useOffset=False, style="plain")
+
+    if windows is not None:
+        for window in windows.itertuples(index=False):
+            for ax in axes:
+                for tow in (window.start_tow, window.end_tow):
+                    ax.axvline(float(tow), color="black", linestyle="--", linewidth=0.8)
+            axes[0].text(
+                (float(window.start_tow) + float(window.end_tow)) / 2, -0.6, f"W{int(window.window)}",
+                ha="center", va="bottom", fontsize=9,
+            )
+
+    fig.suptitle(title)
+    fig.legend(
+        handles=[Patch(facecolor="white", edgecolor="0.6", label="no NAV-SAT")]
+        + [Patch(color=color, label=label)
+           for color, label in zip(colors, ["not tracked", "tracked, not used", "used in fix"])],
+        loc="outside lower center", ncol=4, fontsize=8, frameon=False,
+    )
+    return fig
+
+
 def save_artifacts(
-    result: AoaRunResult, output_dir: str | Path | None = None
+    result: AoaRunResult, output_dir: str | Path | None = None, *,
+    save_figures: bool = True, figure_formats: Sequence[str] = ("png",),
 ) -> dict[str, Path]:
-    """Save CSV artifacts and PNG diagnostics for one AoA run."""
+    """Save analysis tables, with optional diagnostic figure export."""
     directory = Path(output_dir) if output_dir is not None else result.config.output_dir
     directory.mkdir(parents=True, exist_ok=True)
 
@@ -4457,6 +4906,10 @@ def save_artifacts(
         _write_csv(frame, path, index=include_index)
         artifacts[filename] = path
 
+    if not save_figures:
+        result.output_paths = artifacts
+        return artifacts
+
     plot_specs = [
         ("carrier_phase_cycles.png", plot_carrier_phase),
         ("single_difference_cycles.png", plot_single_difference),
@@ -4475,10 +4928,11 @@ def save_artifacts(
     plt = _import_pyplot()
     for filename, plotter in plot_specs:
         fig = plotter(result)
-        path = directory / filename
-        fig.savefig(path, dpi=180)
+        for extension in figure_formats:
+            path = directory / f"{Path(filename).stem}.{extension}"
+            fig.savefig(path, dpi=180)
+            artifacts[path.name] = path
         plt.close(fig)
-        artifacts[filename] = path
 
     result.output_paths = artifacts
     return artifacts
@@ -4551,8 +5005,12 @@ def run_paper_scenario(
     convergence_threshold_deg: float = 5.0,
     save_outputs: bool = True,
     prior_aoa_deg: float | None = None,
+    spoof_branch_m: int | None = None,
     tie_tolerance: float | None = None,
     detection_threshold_deg: float = 10.0,
+    min_valid_spoof_prns: int | None = None,
+    max_gap_epochs: int = 0,
+    save_figures: bool = True,
 ) -> PaperScenarioResult:
     """Run one paper-style AoA flow for all-spoof or partial-spoof scenarios.
 
@@ -4562,6 +5020,12 @@ def run_paper_scenario(
     unresolved), ``tie_tolerance`` overrides its automatic tolerance, and
     ``detection_threshold_deg`` is the paper's AoA-difference threshold used in the
     per-PRN detection table (``spoof_branch_detection``).
+    ``spoof_branch_m`` declares a fixed Eq. 21 branch for the spoof group, mutually
+    exclusive with an AoA prior; the result records ``chosen_by="explicit_m"``.
+    ``min_valid_spoof_prns=None, max_gap_epochs=0`` keeps strict window selection.
+    Otherwise allow a smaller per-epoch group and bounded internal gaps, retain
+    missing measurements, and restart joint branch selection at every gap or
+    change of PRN membership. Gap size counts synchronized epoch rows.
     """
     normalized_spoof_svids = _normalise_svids(spoof_svids) or ()
     output_dir = config.output_dir
@@ -4598,6 +5062,8 @@ def run_paper_scenario(
     cluster_summary = pd.DataFrame()
     reference_alpha_deg: float | None = config.alpha_r_deg
     source_epoch_start = config.start_index
+    window_quality = pd.DataFrame()
+    minimum_spoof_prns = len(normalized_spoof_svids)
 
     if partial_spoof_enabled:
         if not normalized_spoof_svids:
@@ -4620,19 +5086,17 @@ def run_paper_scenario(
         )
         probe_result = run_dataset(probe_config)
 
+        minimum_spoof_prns = _minimum_valid_spoof_prns(
+            min_valid_spoof_prns, len(normalized_spoof_svids)
+        )
         valid_spoof_mask = (
             probe_result.fractional_dd_cycles.reindex(
                 columns=list(normalized_spoof_svids)
             )
             .notna()
-            .all(axis=1)
+            .sum(axis=1)
+            .ge(minimum_spoof_prns)
         )
-        epoch_segment = longest_valid_epoch_segment(valid_spoof_mask)
-        if not epoch_segment:
-            raise ValueError(
-                "No continuous epoch segment has all requested spoof satellites valid."
-            )
-
         reference_alpha_by_epoch = compute_reference_alpha_by_epoch(
             probe_result.epochs,
             full_obs1.navsat,
@@ -4641,6 +5105,22 @@ def run_paper_scenario(
             navsat_tow_decimals=config.navpvt_tow_decimals,
             epoch_tow_column="rcvTow_rx1",
         )
+        if config.reference_svid is None:
+            # The automatic reference needs its NAV-SAT angle at every window epoch;
+            # epochs without it (e.g. first fix after a cold start) end the window.
+            has_reference_alpha = (
+                reference_alpha_by_epoch.set_index("epoch_index")["reference_alpha_deg"]
+                .notna()
+                .reindex(valid_spoof_mask.index, fill_value=False)
+            )
+            valid_spoof_mask &= has_reference_alpha
+        epoch_segment = longest_valid_epoch_segment(valid_spoof_mask, max_gap_epochs=max_gap_epochs)
+        if not epoch_segment:
+            raise ValueError(
+                "No epoch window meets the requested valid spoof-PRN count and gap "
+                "limits with reference NAV-SAT geometry available."
+            )
+
         reference_alpha_window = reference_alpha_by_epoch.loc[
             reference_alpha_by_epoch["epoch_index"].isin(epoch_segment)
         ]
@@ -4651,11 +5131,6 @@ def run_paper_scenario(
             raise ValueError(
                 "Reference NAV-SAT AoA is unavailable inside the selected "
                 "partial-spoof epoch window."
-            )
-        if config.reference_svid is None and missing_reference_alpha.any():
-            raise ValueError(
-                "Reference NAV-SAT AoA is missing inside the selected partial-spoof "
-                "epoch window."
             )
 
         reference_alpha_deg = float(
@@ -4680,20 +5155,43 @@ def run_paper_scenario(
 
     analysis_result = run_dataset(analysis_config)
     if save_outputs:
-        save_artifacts(analysis_result)
+        save_artifacts(analysis_result, save_figures=save_figures)
 
     if partial_spoof_enabled:
+        joint_selector = (
+            select_joint_source_aoa_segments
+            if min_valid_spoof_prns is not None or max_gap_epochs > 0
+            else select_joint_source_aoa
+        )
+        selection_options = (
+            {"min_valid_spoof_prns": minimum_spoof_prns}
+            if joint_selector is select_joint_source_aoa_segments
+            else {"return_branches": True, "return_ambiguity": True}
+        )
         joint_source_aoa, joint_source_branch, joint_source_ambiguity = (
-            select_joint_source_aoa(
+            joint_selector(
                 analysis_result.candidate_aoa_deg,
                 normalized_spoof_svids,
                 metric=config.branch_metric,
                 prior_aoa_deg=prior_aoa_deg,
+                fixed_m=spoof_branch_m,
                 tie_tolerance=tie_tolerance,
-                return_branches=True,
-                return_ambiguity=True,
+                **selection_options,
             )
         )
+        # Include every original epoch so NaNs break plotted lines at missing data.
+        window_index = analysis_result.epochs["epoch_index"].to_numpy()
+        joint_source_aoa = joint_source_aoa.reindex(window_index)
+        joint_source_branch = joint_source_branch.reindex(window_index)
+        window_quality = analysis_result.epochs.copy()
+        window_quality["valid_spoof_prn_count"] = (
+            analysis_result.fractional_dd_cycles.reindex(
+                index=window_index, columns=list(normalized_spoof_svids)
+            ).notna().sum(axis=1).to_numpy()
+        )
+        window_quality["required_spoof_prn_count"] = minimum_spoof_prns
+        window_quality["meets_spoof_prn_requirement"] = window_quality["valid_spoof_prn_count"].ge(minimum_spoof_prns)
+        window_quality["joint_aoa_prn_count"] = joint_source_aoa.notna().sum(axis=1).to_numpy()
         spoof_branch_candidates = summarize_branch_candidates(
             analysis_result.candidate_aoa_deg, normalized_spoof_svids
         )
@@ -4738,28 +5236,36 @@ def run_paper_scenario(
         reference_aoa=ephemeris_aoa_rx1,
         selected_branch=all_satellite_result.selected_branch,
     )
-    ephemeris_aligned_aoa, ephemeris_aligned_branch_series = select_aoa_by_reference(
+    # Authentic SVs: branch m picked per epoch against the ephemeris-based AoA (the default).
+    # The constant-m selection is kept only as a comparison row in the equivalence summary.
+    constant_m_aligned_aoa, constant_m_branch = select_aoa_by_reference(
         all_satellite_result.candidate_aoa_deg,
         ephemeris_aoa_rx1,
         return_branches=True,
     )
+    ephemeris_aligned_aoa, ephemeris_aligned_branch_by_epoch = select_aoa_by_reference_per_epoch(
+        all_satellite_result.candidate_aoa_deg,
+        ephemeris_aoa_rx1,
+    )
     ephemeris_aligned_aoa = sort_svid_columns(
         ephemeris_aligned_aoa.dropna(axis=1, how="all")
     )
-    ephemeris_aligned_branch = _branch_series_to_frame(
-        ephemeris_aligned_branch_series
+    ephemeris_aligned_branch = summarize_per_epoch_branches(
+        ephemeris_aligned_branch_by_epoch, ephemeris_aligned_aoa
     )
     best_m_all_satellite_aoa = build_best_m_all_satellite_aoa(
         all_satellite_dd_aoa,
         ephemeris_aligned_aoa,
         spoof_svids=normalized_spoof_svids,
+        joint_source_aoa=joint_source_aoa if partial_spoof_enabled else None,
     )
     aoa_method_equivalence_summary = summarize_aoa_method_equivalence(
         dp_aoa=all_satellite_dd_aoa,
         dp_branch=all_satellite_result.selected_branch,
-        ephemeris_aligned_aoa=ephemeris_aligned_aoa,
+        ephemeris_aligned_aoa=sort_svid_columns(constant_m_aligned_aoa.dropna(axis=1, how="all")),
         ephemeris_aoa=ephemeris_aoa_rx1,
-        ephemeris_aligned_branch=ephemeris_aligned_branch_series,
+        ephemeris_aligned_branch=constant_m_branch,
+        per_epoch_aligned_aoa=ephemeris_aligned_aoa,
     )
 
     if partial_spoof_enabled and not joint_source_branch.empty:
@@ -4800,6 +5306,15 @@ def run_paper_scenario(
         joint_source_ambiguity=joint_source_ambiguity,
     )
 
+    run_summary["spoof_branch_m"] = spoof_branch_m
+    run_summary["min_valid_spoof_prns"] = minimum_spoof_prns
+    run_summary["max_gap_epochs"] = max_gap_epochs
+    run_summary["analysis_span_s"] = float(analysis_result.epochs["rcvTow_rx1"].iloc[-1] - analysis_result.epochs["rcvTow_rx1"].iloc[0])
+    if not window_quality.empty:
+        valid_epoch_count = int(window_quality["meets_spoof_prn_requirement"].sum())
+        run_summary["valid_spoof_epoch_count"] = valid_epoch_count
+        run_summary["missing_spoof_epoch_count"] = len(window_quality) - valid_epoch_count
+
     scenario_result = PaperScenarioResult(
         config=config,
         partial_spoof_enabled=partial_spoof_enabled,
@@ -4819,6 +5334,7 @@ def run_paper_scenario(
         all_satellite_valid_m_summary=all_satellite_valid_m_summary,
         ephemeris_aligned_dd_method_aoa_deg=ephemeris_aligned_aoa,
         ephemeris_aligned_branch=ephemeris_aligned_branch,
+        ephemeris_aligned_branch_by_epoch=ephemeris_aligned_branch_by_epoch,
         best_m_all_satellite_aoa_deg=best_m_all_satellite_aoa,
         aoa_method_equivalence_summary=aoa_method_equivalence_summary,
         sv_used_rx1=sv_used_rx1,
@@ -4829,10 +5345,11 @@ def run_paper_scenario(
         spoof_branch_candidates=spoof_branch_candidates,
         spoof_branch_detection=spoof_branch_detection,
         prior_aoa_deg=prior_aoa_deg,
+        window_quality=window_quality,
     )
     if save_outputs:
         scenario_result.output_paths = save_paper_scenario_artifacts(
-            scenario_result, output_dir=output_dir
+            scenario_result, output_dir=output_dir, save_figures=save_figures
         )
     return scenario_result
 
@@ -4840,6 +5357,7 @@ def run_paper_scenario(
 def save_paper_scenario_artifacts(
     scenario: PaperScenarioResult,
     output_dir: str | Path | None = None,
+    *, save_figures: bool = True, figure_formats: Sequence[str] = ("png",),
 ) -> dict[str, Path]:
     """Save paper-scenario CSVs and figures that are outside the base DD run."""
     directory = Path(output_dir) if output_dir is not None else scenario.config.output_dir
@@ -4848,6 +5366,7 @@ def save_paper_scenario_artifacts(
 
     csv_specs = [
         ("paper_scenario_run_summary.csv", scenario.run_summary, False),
+        ("paper_window_quality.csv", scenario.window_quality, False),
         (
             "paper_reference_alpha_by_epoch.csv",
             scenario.reference_alpha_by_epoch,
@@ -4917,6 +5436,11 @@ def save_paper_scenario_artifacts(
             False,
         ),
         (
+            "paper_all_satellite_ephemeris_aligned_branch_by_epoch.csv",
+            scenario.ephemeris_aligned_branch_by_epoch,
+            True,
+        ),
+        (
             "paper_all_satellite_dd_method_aoa_best_m_deg.csv",
             scenario.best_m_all_satellite_aoa_deg,
             True,
@@ -4936,6 +5460,10 @@ def save_paper_scenario_artifacts(
         path = directory / filename
         _write_csv(frame, path, index=include_index)
         artifacts[filename] = path
+
+    if not save_figures:
+        scenario.output_paths = artifacts
+        return artifacts
 
     plot_specs = [
         (
@@ -4983,7 +5511,7 @@ def save_paper_scenario_artifacts(
                 scenario.best_m_all_satellite_aoa_deg,
                 title=(
                     "All-satellite DD-method AoA "
-                    "(authentic: best-m vs ephemeris; spoof: DP)"
+                    "(authentic: ephemeris-aligned; spoof: joint source)"
                 ),
                 highlight_svids=scenario.spoof_svids,
             ),
@@ -5018,7 +5546,7 @@ def save_paper_scenario_artifacts(
             lambda: plot_aoa_method_comparison(
                 scenario.ephemeris_aligned_dd_method_aoa_deg,
                 scenario.ephemeris_aoa_rx1_deg,
-                title="Constant-m DD AoA vs ephemeris AoA",
+                title="Per-epoch ephemeris-aligned DD AoA vs ephemeris AoA",
                 highlight_svids=scenario.spoof_svids,
             ),
         ),
@@ -5044,10 +5572,11 @@ def save_paper_scenario_artifacts(
         ):
             continue
         fig = plotter()
-        path = directory / filename
-        fig.savefig(path, dpi=180)
+        for extension in figure_formats:
+            path = directory / f"{Path(filename).stem}.{extension}"
+            fig.savefig(path, dpi=180)
+            artifacts[path.name] = path
         plt.close(fig)
-        artifacts[filename] = path
 
     scenario.output_paths = artifacts
     return artifacts
