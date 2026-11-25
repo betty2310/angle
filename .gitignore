@@ -56,13 +56,7 @@ coverage.xml
 .ipynb_checkpoints/
 
 # Generated analysis artifacts
-/outputs/**
-!/outputs/aoa_paper/
-!/outputs/aoa_paper/sp-partial-19-06/
-!/outputs/aoa_paper/sp-partial-19-06/18-06/
-!/outputs/aoa_paper/sp-partial-19-06/18-06/manuscript_mixed_case/
-!/outputs/aoa_paper/sp-partial-19-06/18-06/manuscript_mixed_case/*.py
-!/outputs/aoa_paper/sp-partial-19-06/18-06/manuscript_mixed_case/*.sh
+/outputs/
 Plot/
 tmp/
 
@@ -72,6 +66,7 @@ tmp/
 # Local datasets are not stored in Git; retain only the directory placeholder.
 /dataset/*
 !/dataset/.keep
+!/dataset/README.md
 
 # Generated figure exports and result workbooks
 *.png
@@ -84,4 +79,16 @@ tmp/
 journal.pdf
 *.html
 
-.playwright-cli/**
+.playwright-cli/
+
+# Local scratch and tooling
+.ropeproject/
+.idea/
+/tutorial/
+/reference/
+
+# Separate repository checked out inside this tree (github.com/betty2310/gnss-aoa-dd)
+/gnss-aoa-dd/
+
+# Private review material, never published
+REVISION_*referee*

@@ -65,16 +65,16 @@ Python >= 3.10, managed with **uv**. Package name `gnss-aoa-angle` (non-packaged
 ```bash
 uv sync                                              # create/refresh the environment
 uv run jupyter notebook AOA_Paper.ipynb             # paper flow on one partial-spoof capture
-uv run jupyter notebook AOA_DD_Ephemeris_Graph_Classifier.ipynb
-uv run python -m unittest                            # run the test suite (~30 tests)
+uv run jupyter notebook notebooks/AOA_DD_Ephemeris_Graph_Classifier.ipynb
+uv run python -m unittest                            # run the test suite (~70 tests, tests/)
 
 # Before a new capture goes through AOA_Paper.ipynb, sanity-check it and the rig:
-uv run python probe_dataset.py dataset/<capture> --spoof <PRNs>
-uv run python calibrate_baseline_azimuth.py dataset/<capture> --spoof <PRNs>
+uv run python scripts/probe_dataset.py dataset/<capture> --spoof <PRNs>
+uv run python scripts/calibrate_baseline_azimuth.py dataset/<capture> --spoof <PRNs>
 
 # Batch driver for the sp-partial-28-08 captures (supports --prior/--metric/--tie-tolerance/
 # --detection-threshold and prints the ambiguity + detection tables):
-uv run python run_sp_partial_28_08.py
+uv run python scripts/run_sp_partial_28_08.py
 ```
 
 ## Architecture
@@ -94,13 +94,19 @@ uv run python run_sp_partial_28_08.py
 - **Notebooks**
   - `AOA_Paper.ipynb` — the lean, current paper flow (config → data check → rig check → run →
     result → diagnostics → outputs). This is the one to edit for paper results.
-  - `AOA_DD_Ephemeris_Graph_Classifier.ipynb` and the `AOA_*_Classifier.ipynb` /
-    `graph_component_classifier.py` set — classifier explorations around the same DD data.
-- **Scripts** — `probe_dataset.py`, `calibrate_baseline_azimuth.py`, `run_sp_partial_28_08.py`
-  are thin CLI wrappers over the corresponding `aoa_pipeline.py` functions.
-- **Tests** — `test_aoa_branch_selection.py`, `test_aoa_pairwise_phase_projection.py`,
-  `test_graph_component_classifier.py`.
-- **Data** — `dataset/<capture>/` UBX logs; `outputs/aoa_paper/` and `Plot/` generated results.
+  - `AOA_Export_Figures.ipynb` — replays a saved experiment and exports paper figures/tables.
+  - `notebooks/AOA_*_Classifier.ipynb` with `graph_component_classifier.py` — classifier
+    explorations around the same DD data. Their first cell chdirs to the repo root.
+  - `archive/AoA_Estimate_archive/` — the pre-refactor paper notebook, reference only.
+- **Scripts** — `scripts/*.py` are CLI wrappers and figure exporters (`probe_dataset.py`,
+  `calibrate_baseline_azimuth.py`, `run_sp_partial_28_08.py`, `run_aoa_figure_report.py`,
+  `export_centered_wrapped_dd_*.py`, ...). Each puts the repo root on `sys.path`; run them from
+  the repo root. `scripts/manuscript_mixed_case/` writes into
+  `outputs/aoa_paper/sp-partial-19-06/18-06/manuscript_mixed_case/`.
+- **Tests** — `tests/test_*.py` (`tests` and `scripts` are packages so tests can import scripts).
+- **Docs** — `docs/` (methodology, HANDOFF, research notes); `CONTEXT.md` stays at the root.
+- **Data** — `dataset/<capture>/` UBX logs (not in Git; hosted on Google Drive, catalogue in
+  `dataset/README.md`); `outputs/` and `Plot/` generated results.
 
 ## The method in one paragraph
 
@@ -109,7 +115,7 @@ carrier phase in cycles has a fractional part tied to `cos(alpha_i) - cos(alpha_
 `alpha` is the baseline-relative AoA and `r` is the reference satellite. Removing the nearest
 integer leaves a wrapped quantity, so each satellite yields several candidate AoA "branches"
 (indexed by an integer `m`); selecting the right branch per satellite/epoch is the central
-problem `aoa_pipeline.py` solves. See `gnss_aoa_paper_methodology_context.md` for the full
+problem `aoa_pipeline.py` solves. See `docs/gnss_aoa_paper_methodology_context.md` for the full
 derivation and `CONTEXT.md` for the exact project vocabulary (use those terms).
 
 ## Conventions & working agreements
@@ -124,9 +130,9 @@ derivation and `CONTEXT.md` for the exact project vocabulary (use those terms).
   `data`-chosen branch and an `unresolved` one mean different things for the paper.
 - **Preserve measurement dropouts**; do not smooth across them.
 - Don't attempt full RTK integer-ambiguity resolution or 2D/3D source localization — out of
-  scope (see `MISSION.md`).
+  scope (see `docs/MISSION.md`).
 - Prefer `uv run ...`; keep new results under `outputs/` or `Plot/`.
-- Read `HANDOFF_aoa_paper_refactor.md` before touching the notebook or `aoa_pipeline.py` — it
+- Read `docs/HANDOFF_aoa_paper_refactor.md` before touching the notebook or `aoa_pipeline.py` — it
   records the latest refactor state and the per-capture validation table.
 
 ## Author
